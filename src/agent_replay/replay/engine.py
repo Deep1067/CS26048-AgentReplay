@@ -111,7 +111,11 @@ class ReplayEngine:
             )
 
         norm_expected_args = _normalize_payload(expected.args_json)
-        norm_actual_args = _normalize_payload(args)
+        # Normalize actual args through JSON round-trip to ensure consistent types (list vs tuple)
+        try:
+            norm_actual_args = json.loads(json.dumps(args, default=list))
+        except Exception:
+            norm_actual_args = args
         if norm_expected_args != norm_actual_args:
             raise ReplayDivergenceError(
                 seq=expected.seq,
