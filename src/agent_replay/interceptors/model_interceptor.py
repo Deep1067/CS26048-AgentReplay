@@ -12,6 +12,7 @@ from langchain_core.outputs import LLMResult
 from agent_replay.context import get_current_session_id, get_current_storage
 from agent_replay.models import Event
 from agent_replay.pricing import get_price_engine
+from agent_replay.replay.context import get_current_replay_engine
 
 
 def _serialize_messages(messages: list[list[BaseMessage]]) -> str:
@@ -145,7 +146,12 @@ class ReplayModelCallbackHandler(BaseCallbackHandler):
 
 
 def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) -> Any:
-    """Explicit functional wrapper to record direct LLM / model calls."""
+    """Explicit functional wrapper to record direct LLM / model calls or replay them."""
+    engine = get_current_replay_engine()
+    if engine:
+        call_args = list(args) if not kwargs else {"args": args, "kwargs": kwargs}
+        return engine.handle_model_call(model_name, call_args, fn, *args, **kwargs)
+
     session_id = get_current_session_id()
     storage = get_current_storage()
     if not session_id or not storage:

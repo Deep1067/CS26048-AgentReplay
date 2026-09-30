@@ -8,6 +8,7 @@ from typing import Any
 
 from agent_replay.context import get_current_session_id, get_current_storage
 from agent_replay.models import Event
+from agent_replay.replay.context import get_current_replay_engine
 
 
 def _safe_json_dumps(obj: Any) -> str:
@@ -21,7 +22,10 @@ def _safe_json_dumps(obj: Any) -> str:
 
 
 def record_tool(tool_name: str | None = None) -> Callable:
-    """Decorator to intercept and record tool calls within an active session."""
+    """Decorator to intercept and record tool calls within an active session,
+
+    or replay recorded tool responses when a ReplayEngine is active.
+    """
 
     def decorator(fn: Callable) -> Callable:
         name = tool_name or getattr(fn, "name", None) or fn.__name__
@@ -30,6 +34,11 @@ def record_tool(tool_name: str | None = None) -> Callable:
 
             @functools.wraps(fn)
             async def async_wrapper(*args, **kwargs):
+                engine = get_current_replay_engine()
+                if engine:
+                    call_args = {"args": args, "kwargs": kwargs} if kwargs else list(args)
+                    return engine.handle_tool_call(name, call_args, fn, *args, **kwargs)
+
                 session_id = get_current_session_id()
                 storage = get_current_storage()
                 if not session_id or not storage:
@@ -68,6 +77,11 @@ def record_tool(tool_name: str | None = None) -> Callable:
 
         @functools.wraps(fn)
         def sync_wrapper(*args, **kwargs):
+            engine = get_current_replay_engine()
+            if engine:
+                call_args = {"args": args, "kwargs": kwargs} if kwargs else list(args)
+                return engine.handle_tool_call(name, call_args, fn, *args, **kwargs)
+
             session_id = get_current_session_id()
             storage = get_current_storage()
             if not session_id or not storage:
