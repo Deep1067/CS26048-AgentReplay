@@ -16,6 +16,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const metricDuration = document.getElementById("metric-duration");
   const metricEvents = document.getElementById("metric-events");
   const metricTokens = document.getElementById("metric-tokens");
+  const flagsContainerEl = document.getElementById("flags-container");
   const timelineEventsEl = document.getElementById("timeline-events");
 
   const filterBtns = document.querySelectorAll(".filter-btn");
@@ -74,7 +75,8 @@ document.addEventListener("DOMContentLoaded", () => {
       sessionDetailEl.classList.remove("hidden");
 
       renderSessionMetrics(currentSessionData);
-      renderTimeline(currentSessionData.events || []);
+      renderFlags(currentSessionData.flags || []);
+      renderTimeline(currentSessionData.events || [], currentSessionData.flags || []);
       renderSessionsList(allSessions);
     } catch (err) {
       alert("Error loading session: " + err.message);
@@ -89,8 +91,34 @@ document.addEventListener("DOMContentLoaded", () => {
     metricTokens.textContent = `${data.total_tokens_in.toLocaleString()} / ${data.total_tokens_out.toLocaleString()}`;
   }
 
-  function renderTimeline(events) {
+  function renderFlags(flags) {
+    if (!flagsContainerEl) return;
+    flagsContainerEl.innerHTML = "";
+    if (!flags.length) {
+      flagsContainerEl.classList.add("hidden");
+      return;
+    }
+
+    flagsContainerEl.classList.remove("hidden");
+    flags.forEach(flag => {
+      const banner = document.createElement("div");
+      banner.className = `flag-banner ${flag.severity}`;
+      const icon = flag.severity === "danger" ? "🚨" : "⚠️";
+      banner.innerHTML = `
+        <span>${icon}</span>
+        <div>
+          <strong>${flag.rule_name.replace(/_/g, " ").toUpperCase()}:</strong> ${flag.message}
+        </div>
+      `;
+      flagsContainerEl.appendChild(banner);
+    });
+  }
+
+  function renderTimeline(events, flags = []) {
     timelineEventsEl.innerHTML = "";
+    const culpritSeqs = new Set();
+    flags.forEach(f => (f.culprit_seqs || []).forEach(s => culpritSeqs.add(s)));
+
     const filtered = events.filter(e => {
       if (currentFilter === "all") return true;
       return e.type === currentFilter;
@@ -102,8 +130,9 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     filtered.forEach(e => {
+      const isCulprit = culpritSeqs.has(e.seq);
       const card = document.createElement("div");
-      card.className = `timeline-card ${e.type}`;
+      card.className = `timeline-card ${e.type} ${isCulprit ? 'culprit' : ''}`;
 
       let argsPretty = e.args_json;
       try {
@@ -125,6 +154,8 @@ document.addEventListener("DOMContentLoaded", () => {
         ? `<div class="error-banner"><strong>Error:</strong> ${e.error}</div>` 
         : "";
 
+      const culpritBadge = isCulprit ? `<span class="flag-pill">Flagged</span>` : "";
+
       card.innerHTML = `
         <div class="timeline-node-dot"></div>
         <div class="card-header">
@@ -132,6 +163,7 @@ document.addEventListener("DOMContentLoaded", () => {
             <span class="seq-badge">#${e.seq}</span>
             <span class="type-pill ${e.type}">${e.type === 'tool_call' ? 'Tool' : 'Model'}</span>
             <span class="event-name">${e.name}</span>
+            ${culpritBadge}
           </div>
           <div class="card-meta-group">
             ${tokenMeta}
@@ -176,7 +208,7 @@ document.addEventListener("DOMContentLoaded", () => {
       btn.classList.add("active");
       currentFilter = btn.getAttribute("data-filter");
       if (currentSessionData) {
-        renderTimeline(currentSessionData.events || []);
+        renderTimeline(currentSessionData.events || [], currentSessionData.flags || []);
       }
     });
   });

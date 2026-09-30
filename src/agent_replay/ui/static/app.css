@@ -471,3 +471,48 @@ body {
   font-size: 12px;
   font-family: var(--font-mono);
 }
+/* Flags and Alerts */
+.flags-container {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.flag-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.flag-banner.danger {
+  background: var(--accent-red-bg);
+  border: 1px solid var(--accent-red);
+  color: #fca5a5;
+}
+
+.flag-banner.warning {
+  background: var(--accent-amber-bg);
+  border: 1px solid var(--accent-amber);
+  color: #fde68a;
+}
+
+.timeline-card.culprit {
+  border-color: var(--accent-red);
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.25);
+}
+
+.flag-pill {
+  background: var(--accent-red);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  margin-left: 8px;
+}
