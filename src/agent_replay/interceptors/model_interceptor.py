@@ -11,6 +11,7 @@ from langchain_core.outputs import LLMResult
 
 from agent_replay.context import get_current_session_id, get_current_storage
 from agent_replay.models import Event
+from agent_replay.pricing import get_price_engine
 
 
 def _serialize_messages(messages: list[list[BaseMessage]]) -> str:
@@ -106,6 +107,7 @@ class ReplayModelCallbackHandler(BaseCallbackHandler):
         duration_ms = round((time.perf_counter() - run_data["t0"]) * 1000, 2)
         tokens_in, tokens_out = _extract_tokens(response)
         result_json = _serialize_generations(response.generations)
+        cost_usd = get_price_engine().calculate_cost(run_data["model_name"], tokens_in, tokens_out)
 
         event = Event(
             session_id=run_data["session_id"],
@@ -118,7 +120,7 @@ class ReplayModelCallbackHandler(BaseCallbackHandler):
             duration_ms=duration_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
-            cost_usd=0.0,
+            cost_usd=cost_usd,
         )
         storage.save_event(event)
 
@@ -178,6 +180,7 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
         except Exception:
             res_json = json.dumps(str(result))
 
+        cost_usd = get_price_engine().calculate_cost(model_name, tokens_in, tokens_out)
         event = Event(
             session_id=session_id,
             seq=0,
@@ -190,6 +193,6 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
             duration_ms=duration_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
-            cost_usd=0.0,
+            cost_usd=cost_usd,
         )
         storage.save_event(event)
