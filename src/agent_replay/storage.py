@@ -13,53 +13,68 @@ class SQLiteStorage:
     """Thread-safe SQLite storage for agent recording sessions and events."""
 
     def __init__(self, db_path: str | Path | None = None):
-        self.db_path = str(db_path or DB_PATH)
+        raw_path = str(db_path or DB_PATH)
+        self.is_memory = raw_path == ":memory:" or "mode=memory" in raw_path
+        if self.is_memory:
+            # Use shared in-memory URI so multiple worker threads share the same database
+            self.db_path = f"file:mem_{id(self)}?mode=memory&cache=shared"
+            self.use_uri = True
+        else:
+            self.db_path = raw_path
+            self.use_uri = False
+
         self._local = threading.local()
+        self._init_lock = threading.Lock()
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = sqlite3.connect(
+                self.db_path,
+                uri=self.use_uri,
+                check_same_thread=False,
+            )
             conn.row_factory = sqlite3.Row
-            if self.db_path != ":memory:":
+            if not self.is_memory:
                 conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=ON;")
             self._local.conn = conn
         return self._local.conn
 
     def _init_db(self) -> None:
-        conn = self._get_connection()
-        with conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id TEXT PRIMARY KEY,
-                    started_at TEXT NOT NULL,
-                    metadata_json TEXT
-                );
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    seq INTEGER NOT NULL,
-                    type TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    args_json TEXT NOT NULL,
-                    result_json TEXT,
-                    error TEXT,
-                    started_at TEXT NOT NULL,
-                    duration_ms REAL NOT NULL,
-                    tokens_in INTEGER DEFAULT 0,
-                    tokens_out INTEGER DEFAULT 0,
-                    cost_usd REAL DEFAULT 0.0,
-                    FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE,
-                    UNIQUE (session_id, seq)
-                );
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_events_session_seq
-                ON events (session_id, seq);
-            """)
+        with self._init_lock:
+            conn = self._get_connection()
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        session_id TEXT PRIMARY KEY,
+                        started_at TEXT NOT NULL,
+                        metadata_json TEXT
+                    );
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        seq INTEGER NOT NULL,
+                        type TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        args_json TEXT NOT NULL,
+                        result_json TEXT,
+                        error TEXT,
+                        started_at TEXT NOT NULL,
+                        duration_ms REAL NOT NULL,
+                        tokens_in INTEGER DEFAULT 0,
+                        tokens_out INTEGER DEFAULT 0,
+                        cost_usd REAL DEFAULT 0.0,
+                        FOREIGN KEY (session_id) REFERENCES sessions (session_id) ON DELETE CASCADE,
+                        UNIQUE (session_id, seq)
+                    );
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_events_session_seq
+                    ON events (session_id, seq);
+                """)
 
     def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> str:
         conn = self._get_connection()

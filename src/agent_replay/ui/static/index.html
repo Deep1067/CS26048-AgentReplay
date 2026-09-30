@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>agent-replay | Timeline & Observability</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="logo-area">
+      <div class="logo-icon">⚡</div>
+      <div>
+        <h1 class="app-title">agent-replay</h1>
+        <p class="app-subtitle">Agent Observability & Deterministic Replay</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <span id="session-count-badge" class="badge badge-neutral">0 Sessions</span>
+      <button id="refresh-btn" class="btn btn-secondary">↻ Refresh</button>
+    </div>
+  </header>
+
+  <div class="app-layout">
+    <!-- Left Sidebar: Session List -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h2>Recorded Sessions</h2>
+        <input type="text" id="session-search" placeholder="Search sessions..." class="search-input">
+      </div>
+      <div id="sessions-list" class="sessions-list">
+        <div class="loading-state">Loading sessions...</div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area: Session Details & Timeline -->
+    <main class="main-content">
+      <div id="no-session-selected" class="empty-state">
+        <div class="empty-icon">🔍</div>
+        <h3>Select a session to view timeline</h3>
+        <p>Choose any session from the left sidebar to reconstruct its chronological tool and model calls.</p>
+      </div>
+
+      <div id="session-detail-view" class="session-detail-view hidden">
+        <!-- Metric Cards -->
+        <section class="metrics-grid">
+          <div class="metric-card">
+            <span class="metric-label">Session ID</span>
+            <span id="metric-session-id" class="metric-value mono">sess_...</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Total Cost</span>
+            <span id="metric-cost" class="metric-value highlight-green">$0.000000</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Total Duration</span>
+            <span id="metric-duration" class="metric-value">0 ms</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Total Events</span>
+            <span id="metric-events" class="metric-value">0</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Total Tokens (In / Out)</span>
+            <span id="metric-tokens" class="metric-value">0 / 0</span>
+          </div>
+        </section>
+
+        <!-- Timeline Header and Filters -->
+        <div class="timeline-controls">
+          <div class="timeline-title-group">
+            <h3>Execution Timeline</h3>
+            <span id="timeline-subtitle" class="text-muted">Chronological order of calls</span>
+          </div>
+          <div class="filter-group">
+            <button class="filter-btn active" data-filter="all">All</button>
+            <button class="filter-btn" data-filter="tool_call">Tools Only</button>
+            <button class="filter-btn" data-filter="model_call">Models Only</button>
+          </div>
+        </div>
+
+        <!-- Timeline Events Container -->
+        <div class="timeline-wrapper">
+          <div class="timeline-line"></div>
+          <div id="timeline-events" class="timeline-events"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
