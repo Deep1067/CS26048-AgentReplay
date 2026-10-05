@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from agent_replay.config import USD_TO_INR
 from agent_replay.detector.config import DetectorConfig
+from agent_replay.detector.engine import DetectorEngine
 from agent_replay.pricing import get_price_engine
 from agent_replay.replay.engine import ReplayEngine
 from agent_replay.replay.exceptions import ReplayDivergenceError
@@ -90,7 +91,19 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
     )
 
     actual_storage = storage or SQLiteStorage()
-    session_service = SessionService(storage=actual_storage)
+    price_engine = get_price_engine()
+    stored_prices = actual_storage.get_setting("prices")
+    if isinstance(stored_prices, dict):
+        price_engine.prices = stored_prices
+
+    detector_config = DetectorConfig.load()
+    stored_detector_config = actual_storage.get_setting("detector_config")
+    if isinstance(stored_detector_config, dict):
+        detector_config = DetectorConfig(**stored_detector_config)
+    session_service = SessionService(
+        storage=actual_storage,
+        detector=DetectorEngine(config=detector_config),
+    )
 
     static_dir = Path(__file__).parent / "ui" / "static"
 
@@ -129,7 +142,11 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
             }
             for name, rate in update.models.items()
         }
-        get_price_engine().save_prices(prices)
+        if actual_storage.is_remote:
+            get_price_engine().prices = prices
+        else:
+            get_price_engine().save_prices(prices)
+        actual_storage.set_setting("prices", prices)
         return _price_response()
 
     @app.get("/api/cost-over-time")
@@ -161,7 +178,9 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
         ):
             raise HTTPException(status_code=400, detail="Detector thresholds must be positive.")
         config = DetectorConfig(**values)
-        config.save()
+        if not actual_storage.is_remote:
+            config.save()
+        actual_storage.set_setting("detector_config", values)
         session_service.detector.config = config
         return vars(config)
 

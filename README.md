@@ -143,6 +143,20 @@ Open your browser to: **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
 - **Chronological Timeline**: Step-by-step visual cards with duration badges, cost pills, and collapsible JSON payloads for both inputs and outputs.
 - **Culprit Highlighting**: Cards identified by anomaly rules glow with red borders and `[FLAGGED]` pills.
 
+## ☁️ Vercel Deployment
+
+The project includes a Vercel ASGI entrypoint in `api/index.py` and uses Turso for persistent serverless storage. Create a Turso database, then configure these Vercel environment variables for Production, Preview, and Development:
+
+```text
+TURSO_DATABASE_URL
+TURSO_AUTH_TOKEN
+GEMINI_API_KEY
+DEFAULT_MODEL
+USD_TO_INR
+```
+
+Import `Deep1067/CS26048-AgentReplay` into Vercel with the repository root as the project directory. The first application startup creates the required sessions, events, and settings tables automatically. Pricing and detector settings are stored in the database when Turso is configured; local development continues to use SQLite and local configuration files.
+
 ---
 
 ## 🧪 Running Automated Tests
