@@ -11,6 +11,7 @@ class Event:
     args_json: str
     result_json: str | None = None
     error: str | None = None
+    error_type: str | None = None
     started_at: str = ""
     duration_ms: float = 0.0
     tokens_in: int = 0

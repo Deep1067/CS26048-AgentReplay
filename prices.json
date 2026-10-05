@@ -24,6 +24,14 @@
       "input_cost_per_million": 2.50,
       "output_cost_per_million": 10.00
     },
+    "gemini-3.8-flash": {
+      "input_cost_per_million": 0.10,
+      "output_cost_per_million": 0.40
+    },
+    "gemini-3.8-flash-lite": {
+      "input_cost_per_million": 0.04,
+      "output_cost_per_million": 0.16
+    },
     "default": {
       "input_cost_per_million": 0.10,
       "output_cost_per_million": 0.40

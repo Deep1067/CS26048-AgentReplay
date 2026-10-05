@@ -42,35 +42,39 @@ class RepeatedToolCallsRule(Rule):
         config: DetectorConfig,
     ) -> list[Flag]:
         flags = []
-        tool_events = [e for e in events if e.type == "tool_call"]
-        if not tool_events:
-            return flags
+        seen_patterns = set()
+        current_pattern = None
+        current_events = []
 
-        consecutive_count = 1
-        seq_group = [tool_events[0].seq]
+        def evaluate_run() -> None:
+            if len(current_events) < config.max_repeated_tool_calls:
+                return
+            pattern = current_pattern
+            if pattern in seen_patterns:
+                return
+            seen_patterns.add(pattern)
+            flags.append(
+                Flag(
+                    rule_name="repeated_tool_calls",
+                    severity="danger",
+                    message=(
+                        f"Tool '{current_pattern[0]}' was called {len(current_events)} times "
+                        "consecutively with identical arguments."
+                    ),
+                    culprit_seqs=[event.seq for event in current_events],
+                )
+            )
 
-        for i in range(1, len(tool_events)):
-            prev = tool_events[i - 1]
-            curr = tool_events[i]
+        for event in events:
+            pattern = (event.name, event.args_json) if event.type == "tool_call" else None
+            if pattern != current_pattern:
+                evaluate_run()
+                current_pattern = pattern
+                current_events = []
+            if pattern is not None:
+                current_events.append(event)
 
-            if prev.name == curr.name and prev.args_json == curr.args_json:
-                consecutive_count += 1
-                seq_group.append(curr.seq)
-                if consecutive_count >= config.max_repeated_tool_calls:
-                    flags.append(
-                        Flag(
-                            rule_name="repeated_tool_calls",
-                            severity="danger",
-                            message=(
-                                f"Tool '{curr.name}' was called {consecutive_count} times "
-                                f"consecutively with identical arguments."
-                            ),
-                            culprit_seqs=list(seq_group),
-                        )
-                    )
-            else:
-                consecutive_count = 1
-                seq_group = [curr.seq]
+        evaluate_run()
 
         return flags
 

@@ -21,6 +21,11 @@ def _normalize_payload(payload: Any) -> Any:
     return payload
 
 
+def _raise_recorded_error(error: str, error_type: str | None) -> None:
+    recorded_type = error_type or "Exception"
+    raise Exception(f"{recorded_type}: {error}") from None
+
+
 class ReplayEngine:
     """Deterministic replay engine supporting STRICT and FORKED modes."""
 
@@ -152,6 +157,9 @@ class ReplayEngine:
         if self.forked_session_id:
             self.storage.save_event(expected)
 
+        if expected.error is not None:
+            _raise_recorded_error(expected.error, expected.error_type)
+
         if expected.result_json is not None:
             try:
                 return json.loads(expected.result_json)
@@ -222,10 +230,24 @@ class ReplayEngine:
                 actual_args=messages_or_prompt,
             )
 
+        if expected.name != model_name:
+            raise ReplayDivergenceError(
+                seq=expected.seq,
+                expected_type=expected.type,
+                expected_name=expected.name,
+                expected_args=expected.args_json,
+                actual_type="model_call",
+                actual_name=model_name,
+                actual_args=messages_or_prompt,
+            )
+
         self.cursor += 1
 
         if self.forked_session_id:
             self.storage.save_event(expected)
+
+        if expected.error is not None:
+            _raise_recorded_error(expected.error, expected.error_type)
 
         try:
             return json.loads(expected.result_json) if expected.result_json else None

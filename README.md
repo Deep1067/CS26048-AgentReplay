@@ -1,8 +1,17 @@
-# ⚡ agent-replay
+# ⚡ CS26048-AgentReplay
 
 > **A logging proxy, observability timeline, and deterministic replay engine for AI agent tool and model calls.**
 
 Developed as the practical implementation of **Project Proposal (24CS061)**.
+
+## Project Documents
+
+- [Problem Statement](docs/Problem-Statement.md)
+- [Literature Survey](docs/Literature-Survey.md)
+- [Project Timeline](docs/Project-Timeline.md)
+- [Requirements](docs/Requirements.md)
+- [Project Proposal](docs/PROPOSAL.md)
+- [Architecture and implementation decisions](docs/DECISIONS.md)
 
 ---
 
@@ -35,6 +44,8 @@ graph TD
     DB -->|Scan Sessions| Detector[Rule-Based Anomaly Detector]
     Detector -->|Attach Flags & Culprit IDs| UI
 ```
+
+Model-call replay is implemented and validated for explicit model wrappers (the ADK-style loop). For LangGraph, model calls are recorded for audit/cost tracking but the live model is still called during replay; LangGraph model-call substitution is a known limitation, listed in Future Work.
 
 ---
 
@@ -76,7 +87,7 @@ pip install -r requirements.txt
 Set up your Gemini API Key in `.env`:
 ```env
 GEMINI_API_KEY=AIzaSy...
-DEFAULT_MODEL=gemini-1.5-flash
+DEFAULT_MODEL=gemini-3.8-flash
 ```
 
 Configure or customize token prices in `prices.json`:

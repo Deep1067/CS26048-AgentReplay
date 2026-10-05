@@ -22,6 +22,7 @@ def test_scenario_1_execution():
 
     storage = SQLiteStorage(db_path=":memory:")
     run_looping_agent(storage)
+    run_looping_agent(storage)
 
     events = storage.get_events("demo_scenario_1_loop")
     assert len(events) == 3
@@ -29,9 +30,15 @@ def test_scenario_1_execution():
     assert all(e.name == "search_docs" for e in events)
     assert all(e.args_json == events[0].args_json for e in events)
 
+    from agent_replay.session_service import SessionService
+
+    details = SessionService(storage=storage).get_session_details("demo_scenario_1_loop")
+    assert details is not None
+    assert len(details["flags"]) == 1
+
 
 def test_scenario_2_execution():
     """Scenario 2: Live failure -> strict replay -> forked recovery."""
     from scenarios.scenario_2_malformed_response import run_scenario
 
-    run_scenario()
+    run_scenario(SQLiteStorage(db_path=":memory:"))

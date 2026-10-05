@@ -16,6 +16,7 @@ recorded_search = record_tool("search_docs")(search_docs)
 
 def run_looping_agent(storage: SQLiteStorage) -> None:
     session_id = "demo_scenario_1_loop"
+    storage.delete_session(session_id)
     print(f"\n--- Running Scenario 1: Looping Agent (Session: {session_id}) ---")
 
     with record_session(session_id, storage=storage):

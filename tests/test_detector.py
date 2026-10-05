@@ -86,6 +86,26 @@ def test_repeated_tool_calls_not_triggered_when_different_args(storage):
     assert len(flags) == 0
 
 
+def test_repeated_tool_calls_deduplicates_each_pattern(storage):
+    rule = RepeatedToolCallsRule()
+    config = DetectorConfig(max_repeated_tool_calls=3)
+    events = [
+        Event(
+            session_id="s3",
+            seq=seq,
+            type="tool_call",
+            name="search_docs",
+            args_json=json.dumps({"q": "docs"}),
+        )
+        for seq in range(1, 6)
+    ]
+
+    flags = rule.evaluate("s3", events, storage, config)
+
+    assert len(flags) == 1
+    assert flags[0].culprit_seqs == [1, 2, 3, 4, 5]
+
+
 def test_high_cost_session_rule(storage):
     rule = HighCostSessionRule()
     config = DetectorConfig(cost_multiplier_over_median=3.0, min_sessions_for_cost_median=3)

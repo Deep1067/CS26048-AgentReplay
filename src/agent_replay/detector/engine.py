@@ -18,7 +18,7 @@ class DetectorEngine:
         config: DetectorConfig | None = None,
         rules: list[Rule] | None = None,
     ):
-        self.config = config or DetectorConfig()
+        self.config = config or DetectorConfig.load()
         self.rules = rules or [
             RepeatedToolCallsRule(),
             HighCostSessionRule(),

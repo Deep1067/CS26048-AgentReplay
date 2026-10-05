@@ -45,6 +45,12 @@ class PriceEngine:
         cost_out = (tokens_out * rates.get("output_cost_per_million", 0.0)) / 1_000_000.0
         return round(cost_in + cost_out, 8)
 
+    def save_prices(self, prices: dict[str, dict[str, float]]) -> None:
+        self.prices = prices
+        with self.prices_path.open("w", encoding="utf-8") as file:
+            json.dump({"models": prices}, file, indent=2)
+            file.write("\n")
+
 
 _GLOBAL_PRICE_ENGINE: PriceEngine | None = None
 

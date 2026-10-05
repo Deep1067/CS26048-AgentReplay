@@ -79,6 +79,23 @@ def test_strict_replay_divergence_detection(storage):
     assert "unexpected query" in str(err.actual_args)
 
 
+def test_strict_replay_model_name_mismatch(storage):
+    def mock_llm():
+        return "recorded response"
+
+    with record_session("model_name_sess", storage=storage):
+        record_model_call("recorded-model", mock_llm)
+
+    with pytest.raises(ReplayDivergenceError) as exc_info:
+        with replay_session("model_name_sess", storage=storage, mode="strict"):
+            record_model_call("different-model", mock_llm)
+
+    error = exc_info.value
+    assert error.seq == 1
+    assert error.expected_name == "recorded-model"
+    assert error.actual_name == "different-model"
+
+
 def test_strict_replay_completed_error(storage):
     @record_tool(tool_name="tool_a")
     def tool_a():
@@ -92,6 +109,24 @@ def test_strict_replay_completed_error(storage):
             tool_a()
             # Attempt second call after trace is finished
             tool_a()
+
+
+def test_strict_replay_reraises_recorded_tool_error(storage):
+    @record_tool(tool_name="failing_tool")
+    def failing_tool():
+        raise ValueError("recorded failure")
+
+    with record_session("failed_tool_sess", storage=storage):
+        with pytest.raises(ValueError, match="recorded failure"):
+            failing_tool()
+
+    event = storage.get_events("failed_tool_sess")[0]
+    assert event.error == "recorded failure"
+    assert event.error_type == "ValueError"
+
+    with replay_session("failed_tool_sess", storage=storage, mode="strict"):
+        with pytest.raises(Exception, match="ValueError: recorded failure"):
+            failing_tool()
 
 
 def test_forked_replay_with_substitution(storage):

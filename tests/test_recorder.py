@@ -117,6 +117,41 @@ async def test_async_tool_interceptor(storage):
     assert events[0].duration_ms >= 5.0
 
 
+def test_concurrent_seq_allocation(storage):
+    import threading
+
+    session_id = "session_concurrent"
+    storage.create_session(session_id)
+    errors: list[BaseException] = []
+
+    def worker(i: int) -> None:
+        try:
+            storage.save_event(
+                Event(
+                    session_id=session_id,
+                    seq=0,
+                    type="tool_call",
+                    name=f"tool_{i}",
+                    args_json=json.dumps({"i": i}),
+                    result_json=json.dumps({"ok": True}),
+                    duration_ms=1.0,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    events = storage.get_events(session_id)
+    assert len(events) == 20
+    assert [event.seq for event in events] == list(range(1, 21))
+
+
 def test_record_model_call(storage):
     class MockUsage:
         prompt_token_count = 120

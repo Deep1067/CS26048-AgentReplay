@@ -64,3 +64,113 @@ def test_api_serve_index(client):
     res = client.get("/")
     assert res.status_code == 200
     assert "agent-replay" in res.text
+
+
+def test_api_cors_allows_localhost_only(client):
+    allowed = client.get("/api/sessions", headers={"Origin": "http://localhost"})
+    blocked = client.get("/api/sessions", headers={"Origin": "https://example.com"})
+
+    assert allowed.headers["access-control-allow-origin"] == "http://localhost"
+    assert "access-control-allow-origin" not in blocked.headers
+
+
+def test_api_replay_returns_matched_events(client):
+    res = client.post("/api/replay", json={"session_id": "sess_api_test"})
+
+    assert res.status_code == 200
+    data = res.json()
+    assert data["events"] == [
+        {
+            "id": 1,
+            "type": "tool_call",
+            "name": "calculator",
+            "status": "matched",
+            "recorded_result": {"result": 15},
+        }
+    ]
+    assert data["halted"] is False
+
+
+def test_api_replay_reports_divergence(client):
+    res = client.post(
+        "/api/replay",
+        json={
+            "session_id": "sess_api_test",
+            "calls": [{"type": "tool_call", "name": "other_tool", "args": {}}],
+        },
+    )
+
+    assert res.status_code == 200
+    event = res.json()["events"][0]
+    assert event["status"] == "diverged"
+    assert event["recorded"]["name"] == "calculator"
+    assert event["requested"]["name"] == "other_tool"
+    assert res.json()["halted"] is True
+
+
+def test_api_replay_reports_tool_substitution(client):
+    res = client.post(
+        "/api/replay",
+        json={
+            "session_id": "sess_api_test",
+            "mode": "forked",
+            "substitute_seq": 1,
+            "substitute_result": {"result": 99},
+        },
+    )
+
+    assert res.status_code == 200
+    assert res.json()["events"][0]["status"] == "substituted"
+
+
+def test_api_cost_over_time(client):
+    res = client.get("/api/cost-over-time")
+
+    assert res.status_code == 200
+    assert res.json()["points"][0]["session_id"] == "sess_api_test"
+
+
+def test_api_updates_prices_in_inr(tmp_path, monkeypatch):
+    from agent_replay import api as api_module
+    from agent_replay.pricing import PriceEngine
+
+    engine = PriceEngine(tmp_path / "prices.json")
+    monkeypatch.setattr(api_module, "get_price_engine", lambda: engine)
+    app = create_app(storage=SQLiteStorage(db_path=":memory:"))
+    test_client = TestClient(app)
+
+    res = test_client.put(
+        "/api/prices",
+        json={
+            "models": {
+                "test-model": {"input_inr_per_1k": 8.3, "output_inr_per_1k": 16.6}
+            }
+        },
+    )
+
+    assert res.status_code == 200
+    assert res.json()["models"]["test-model"] == {
+        "input_inr_per_1k": 8.3,
+        "output_inr_per_1k": 16.6,
+    }
+    assert engine.prices["test-model"]["input_cost_per_million"] == 100.0
+
+
+def test_api_updates_detector_config(tmp_path, monkeypatch):
+    from agent_replay.detector import config as detector_config
+
+    monkeypatch.setattr(detector_config, "DETECTOR_CONFIG_PATH", tmp_path / "detector.json")
+    app = create_app(storage=SQLiteStorage(db_path=":memory:"))
+    test_client = TestClient(app)
+    update = {
+        "max_repeated_tool_calls": 5,
+        "cost_multiplier_over_median": 4.0,
+        "min_sessions_for_cost_median": 3,
+        "max_duration_ms": 120000.0,
+        "max_events_per_session": 40,
+    }
+
+    res = test_client.put("/api/detector-config", json=update)
+
+    assert res.status_code == 200
+    assert res.json() == update

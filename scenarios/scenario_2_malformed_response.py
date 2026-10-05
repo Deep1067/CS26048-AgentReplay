@@ -11,8 +11,6 @@ from agent_replay.recorder import record_session
 from agent_replay.replay.engine import replay_session
 from agent_replay.storage import SQLiteStorage
 
-storage = SQLiteStorage()
-
 
 @record_tool("query_user_account")
 def query_user_account(user_id: int):
@@ -34,8 +32,13 @@ def agent_workflow():
     return calculate_credit(account.get("balance"))
 
 
-def run_scenario():
+def run_scenario(storage: SQLiteStorage | None = None) -> None:
+    storage = storage or SQLiteStorage()
     session_id = "demo_scenario_2_failure"
+    forked_session = "demo_scenario_2_recovered"
+    storage.delete_session(session_id)
+    storage.delete_session(forked_session)
+
     print(f"\n=== Step 1: Live Run with Tool Failure (Session: {session_id}) ===")
     with record_session(session_id, storage=storage):
         live_result = agent_workflow()
@@ -49,8 +52,6 @@ def run_scenario():
         print("✓ Verified: Failure reproduced identically without re-invoking real services!")
 
     print("\n=== Step 3: Forked Replay with Response Substitution at Seq #1 ===")
-    # Substitute the failure with valid data: {"status": "ok", "balance": 500.0}
-    forked_session = "demo_scenario_2_recovered"
     with replay_session(
         session_id,
         storage=storage,

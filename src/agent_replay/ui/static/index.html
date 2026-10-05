@@ -38,13 +38,21 @@
 
     <!-- Main Content Area: Session Details & Timeline -->
     <main class="main-content">
-      <div id="no-session-selected" class="empty-state">
-        <div class="empty-icon">🔍</div>
-        <h3>Select a session to view timeline</h3>
-        <p>Choose any session from the left sidebar to reconstruct its chronological tool and model calls.</p>
-      </div>
+      <nav class="tab-bar" aria-label="Workspace views">
+        <button class="tab-btn active" data-tab="timeline" aria-selected="true">Timeline</button>
+        <button class="tab-btn" data-tab="replay" aria-selected="false">Replay</button>
+        <button class="tab-btn" data-tab="cost" aria-selected="false">Cost and pricing</button>
+        <button class="tab-btn" data-tab="detector" aria-selected="false">Detector rules</button>
+      </nav>
 
-      <div id="session-detail-view" class="session-detail-view hidden">
+      <section id="tab-timeline" class="tab-panel active" data-panel="timeline">
+        <div id="no-session-selected" class="empty-state">
+          <div class="empty-icon">🔍</div>
+          <h3>Select a session to view timeline</h3>
+          <p>Choose any session from the left sidebar to reconstruct its chronological tool and model calls.</p>
+        </div>
+
+        <div id="session-detail-view" class="session-detail-view hidden">
         <!-- Metric Cards -->
         <section class="metrics-grid">
           <div class="metric-card">
@@ -87,7 +95,65 @@
           <div class="timeline-line"></div>
           <div id="timeline-events" class="timeline-events"></div>
         </div>
-      </div>
+        </div>
+      </section>
+
+      <section id="tab-replay" class="tab-panel" data-panel="replay" hidden>
+        <div class="panel-card">
+          <h2>Replay</h2>
+          <div class="replay-toolbar">
+            <label class="control-group">
+              <span class="metric-label">Session</span>
+              <select id="replay-session-select" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Mode</span>
+              <select id="replay-mode-select" class="select-input">
+                <option value="strict">Strict</option>
+                <option value="forked">Forked</option>
+              </select>
+            </label>
+            <button id="run-replay-btn" class="btn btn-primary">Run replay</button>
+          </div>
+          <div id="replay-results" class="replay-results">
+            <p class="text-muted">Select a session and run replay to inspect each event.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-cost" class="tab-panel" data-panel="cost" hidden>
+        <div class="panel-card">
+          <h2>Cost and pricing</h2>
+          <p id="pricing-exchange-note" class="text-muted"></p>
+          <div class="table-scroll">
+            <table class="pricing-table">
+              <thead>
+                <tr>
+                  <th>Model</th>
+                  <th>Input INR / 1K</th>
+                  <th>Output INR / 1K</th>
+                </tr>
+              </thead>
+              <tbody id="pricing-table-body"></tbody>
+            </table>
+          </div>
+          <button id="save-pricing-btn" class="btn btn-primary">Save pricing</button>
+          <h3 class="section-heading">Cost over time</h3>
+          <div id="cost-history" class="cost-history">
+            <p class="text-muted">Loading session costs...</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-detector" class="tab-panel" data-panel="detector" hidden>
+        <div class="panel-card">
+          <h2>Detector rules</h2>
+          <p class="text-muted">Thresholds apply to newly loaded session evaluations.</p>
+          <div id="detector-config-form" class="detector-config-form"></div>
+          <button id="save-detector-btn" class="btn btn-primary">Save detector rules</button>
+          <p id="detector-config-status" class="text-muted"></p>
+        </div>
+      </section>
     </main>
   </div>
 

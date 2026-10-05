@@ -139,6 +139,7 @@ class ReplayModelCallbackHandler(BaseCallbackHandler):
             name=run_data["model_name"],
             args_json=run_data["args_json"],
             error=str(error),
+            error_type=type(error).__name__,
             started_at=run_data["started_at"],
             duration_ms=duration_ms,
         )
@@ -166,6 +167,7 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
     t0 = time.perf_counter()
     result = None
     error_msg = None
+    error_type = None
     tokens_in = 0
     tokens_out = 0
 
@@ -178,6 +180,7 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
         return result
     except Exception as e:
         error_msg = str(e)
+        error_type = type(e).__name__
         raise
     finally:
         duration_ms = round((time.perf_counter() - t0) * 1000, 2)
@@ -195,6 +198,7 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
             args_json=args_json,
             result_json=res_json if error_msg is None else None,
             error=error_msg,
+            error_type=error_type,
             started_at=started_at,
             duration_ms=duration_ms,
             tokens_in=tokens_in,

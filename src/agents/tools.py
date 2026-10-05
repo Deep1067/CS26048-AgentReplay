@@ -37,7 +37,7 @@ def search_docs(query: str) -> str:
 
 
 def create_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE users (

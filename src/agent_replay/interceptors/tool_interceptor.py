@@ -51,11 +51,13 @@ def record_tool(tool_name: str | None = None) -> Callable:
 
                 result = None
                 error_msg = None
+                error_type = None
                 try:
                     result = await fn(*args, **kwargs)
                     return result
                 except Exception as e:
                     error_msg = str(e)
+                    error_type = type(e).__name__
                     raise
                 finally:
                     duration_ms = round((time.perf_counter() - t0) * 1000, 2)
@@ -68,6 +70,7 @@ def record_tool(tool_name: str | None = None) -> Callable:
                         args_json=args_json,
                         result_json=res_json,
                         error=error_msg,
+                        error_type=error_type,
                         started_at=start_iso,
                         duration_ms=duration_ms,
                     )
@@ -94,11 +97,13 @@ def record_tool(tool_name: str | None = None) -> Callable:
 
             result = None
             error_msg = None
+            error_type = None
             try:
                 result = fn(*args, **kwargs)
                 return result
             except Exception as e:
                 error_msg = str(e)
+                error_type = type(e).__name__
                 raise
             finally:
                 duration_ms = round((time.perf_counter() - t0) * 1000, 2)
@@ -111,6 +116,7 @@ def record_tool(tool_name: str | None = None) -> Callable:
                     args_json=args_json,
                     result_json=res_json,
                     error=error_msg,
+                    error_type=error_type,
                     started_at=start_iso,
                     duration_ms=duration_ms,
                 )
