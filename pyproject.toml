@@ -41,3 +41,6 @@ ignore = []
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+
+[tool.vercel]
+entrypoint = "app.py"
