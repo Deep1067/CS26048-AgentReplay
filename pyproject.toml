@@ -43,4 +43,4 @@ pythonpath = ["src"]
 asyncio_mode = "auto"
 
 [tool.vercel]
-entrypoint = "app.py"
+entrypoint = "app:app"
