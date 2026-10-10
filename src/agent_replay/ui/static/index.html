@@ -41,6 +41,7 @@
       <nav class="tab-bar" aria-label="Workspace views">
         <button class="tab-btn active" data-tab="timeline" aria-selected="true">Timeline</button>
         <button class="tab-btn" data-tab="replay" aria-selected="false">Replay</button>
+        <button class="tab-btn" data-tab="live" aria-selected="false">Live run</button>
         <button class="tab-btn" data-tab="cost" aria-selected="false">Cost and pricing</button>
         <button class="tab-btn" data-tab="detector" aria-selected="false">Detector rules</button>
       </nav>
@@ -118,6 +119,23 @@
           <div id="replay-results" class="replay-results">
             <p class="text-muted">Select a session and run replay to inspect each event.</p>
           </div>
+        </div>
+      </section>
+
+      <section id="tab-live" class="tab-panel" data-panel="live" hidden>
+        <div class="panel-card">
+          <h2>Live Run</h2>
+          <p class="text-muted">Execute a server-defined agent scenario with a 5-step cap and safe internal timeout.</p>
+          <div class="live-run-toolbar">
+            <label class="control-group">
+              <span class="metric-label">Select Scenario</span>
+              <select id="live-scenario-select" class="select-input">
+                <option value="">Loading scenarios...</option>
+              </select>
+            </label>
+            <button id="run-live-btn" class="btn btn-primary">Run Live Scenario</button>
+          </div>
+          <div id="live-run-status" class="live-run-status hidden"></div>
         </div>
       </section>
 

@@ -1,1 +1,3 @@
 Model-call replay is implemented and validated for explicit model wrappers (the ADK-style loop). For LangGraph, model calls are recorded for audit/cost tracking but the live model is still called during replay; LangGraph model-call substitution is a known limitation, listed in Future Work.
+
+Live Run endpoint (POST /api/live/run) is guarded by X-Demo-Key header matching DEMO_API_KEY env var; runs are capped at 5 steps via StepCappedStorage proxy and internally time-boxed at 15 s using asyncio.wait_for so a partial session is always saved and returned even on timeout, preventing a raw Vercel 504.

@@ -26,9 +26,13 @@ document.addEventListener("DOMContentLoaded", () => {
   const pricingTableBody = document.getElementById("pricing-table-body");
   const savePricingBtn = document.getElementById("save-pricing-btn");
   const costHistoryEl = document.getElementById("cost-history");
+  const DEMO_KEY = "demo_secret_key_123";
   const detectorConfigForm = document.getElementById("detector-config-form");
   const saveDetectorBtn = document.getElementById("save-detector-btn");
   const detectorConfigStatus = document.getElementById("detector-config-status");
+  const liveScenarioSelect = document.getElementById("live-scenario-select");
+  const runLiveBtn = document.getElementById("run-live-btn");
+  const liveRunStatusEl = document.getElementById("live-run-status");
 
   const filterBtns = document.querySelectorAll(".filter-btn");
   const tabBtns = document.querySelectorAll(".tab-btn");
@@ -51,6 +55,7 @@ document.addEventListener("DOMContentLoaded", () => {
       fetchCostHistory();
     }
     if (tabName === "detector") fetchDetectorConfig();
+    if (tabName === "live") fetchLiveScenarios();
   }
 
   const detectorFields = [
@@ -511,6 +516,92 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  async function fetchLiveScenarios() {
+    if (!liveScenarioSelect) return;
+    try {
+      const res = await fetch("/api/live/scenarios");
+      if (!res.ok) throw new Error("Failed to load live scenarios");
+      const scenarios = await res.json();
+      liveScenarioSelect.replaceChildren();
+      Object.entries(scenarios).forEach(([id, details]) => {
+        const option = document.createElement("option");
+        option.value = id;
+        option.textContent = `${details.label} — ${details.description} (${details.expected_duration})`;
+        liveScenarioSelect.appendChild(option);
+      });
+    } catch (err) {
+      liveScenarioSelect.replaceChildren();
+      const errOpt = document.createElement("option");
+      errOpt.textContent = `Error loading scenarios: ${err.message}`;
+      liveScenarioSelect.appendChild(errOpt);
+    }
+  }
+
+  async function runLiveScenario() {
+    if (!liveScenarioSelect || !liveScenarioSelect.value) return;
+    const scenarioId = liveScenarioSelect.value;
+    try {
+      runLiveBtn.disabled = true;
+      liveScenarioSelect.disabled = true;
+
+      liveRunStatusEl.className = "live-run-status running";
+      liveRunStatusEl.replaceChildren();
+      const statusText = document.createElement("span");
+      statusText.textContent = "⚡ Running live scenario...";
+      liveRunStatusEl.appendChild(statusText);
+      liveRunStatusEl.classList.remove("hidden");
+
+      const res = await fetch("/api/live/run", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Demo-Key": DEMO_KEY,
+        },
+        body: JSON.stringify({ scenario_id: scenarioId }),
+      });
+      const data = await res.json();
+
+      liveRunStatusEl.replaceChildren();
+      const msgSpan = document.createElement("span");
+
+      if (res.ok && (data.status === "done" || data.status === "step_limit_reached")) {
+        liveRunStatusEl.className = "live-run-status done";
+        msgSpan.textContent = `Done - ${data.event_count} events, cost Rs. ${data.total_cost_inr}`;
+      } else if (res.ok && data.status === "timed_out") {
+        liveRunStatusEl.className = "live-run-status timed_out";
+        msgSpan.textContent = `Timed out after ${data.event_count} events - partial session saved`;
+      } else {
+        liveRunStatusEl.className = "live-run-status error";
+        msgSpan.textContent = `Run failed: ${data.detail || data.message || "Unknown error"}`;
+      }
+      liveRunStatusEl.appendChild(msgSpan);
+
+      if (data.session_id) {
+        const linkBtn = document.createElement("button");
+        linkBtn.type = "button";
+        linkBtn.className = "btn-link";
+        linkBtn.textContent = `View timeline (${data.session_id}) →`;
+        linkBtn.addEventListener("click", async () => {
+          await fetchSessions();
+          await selectSession(data.session_id);
+          switchTab("timeline");
+        });
+        liveRunStatusEl.appendChild(linkBtn);
+      }
+
+      await fetchSessions();
+    } catch (err) {
+      liveRunStatusEl.className = "live-run-status error";
+      liveRunStatusEl.replaceChildren();
+      const errSpan = document.createElement("span");
+      errSpan.textContent = `Error: ${err.message}`;
+      liveRunStatusEl.appendChild(errSpan);
+    } finally {
+      runLiveBtn.disabled = false;
+      liveScenarioSelect.disabled = false;
+    }
+  }
+
   // Event Listeners
   sessionSearchInput.addEventListener("input", (e) => {
     const q = e.target.value.toLowerCase();
@@ -538,6 +629,9 @@ document.addEventListener("DOMContentLoaded", () => {
   runReplayBtn.addEventListener("click", () => runReplay());
   savePricingBtn.addEventListener("click", savePricing);
   saveDetectorBtn.addEventListener("click", saveDetectorConfig);
+  if (runLiveBtn) {
+    runLiveBtn.addEventListener("click", runLiveScenario);
+  }
 
   fetchSessions();
 });

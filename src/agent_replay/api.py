@@ -1,20 +1,138 @@
+import asyncio
+import os
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent_replay.config import USD_TO_INR
+from agent_replay.config import DEMO_API_KEY, USD_TO_INR
 from agent_replay.detector.config import DetectorConfig
 from agent_replay.detector.engine import DetectorEngine
+from agent_replay.models import Event
 from agent_replay.pricing import get_price_engine
 from agent_replay.replay.engine import ReplayEngine
 from agent_replay.replay.exceptions import ReplayDivergenceError
 from agent_replay.session_service import SessionService
 from agent_replay.storage import SQLiteStorage
+
+
+class StepLimitExceeded(Exception):
+    """Raised when live execution reaches the hard step limit cap."""
+
+    pass
+
+
+class StepCappedStorage:
+    """Storage proxy enforcing a hard cap of N recorded events per session."""
+
+    def __init__(self, target: SQLiteStorage, max_steps: int = 5):
+        self.target = target
+        self.max_steps = max_steps
+        self.step_count = 0
+        self.is_remote = getattr(target, "is_remote", False)
+
+    def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> str:
+        return self.target.create_session(session_id, metadata)
+
+    def get_next_seq(self, session_id: str) -> int:
+        return self.target.get_next_seq(session_id)
+
+    def save_event(self, event: Event) -> Event:
+        if self.step_count >= self.max_steps:
+            raise StepLimitExceeded(f"Hard step cap of {self.max_steps} reached.")
+        res = self.target.save_event(event)
+        self.step_count += 1
+        return res
+
+    def get_events(self, session_id: str) -> list[Event]:
+        return self.target.get_events(session_id)
+
+    def list_sessions(self):
+        return self.target.list_sessions()
+
+    def get_session(self, session_id: str):
+        return self.target.get_session(session_id)
+
+    def delete_session(self, session_id: str) -> None:
+        self.target.delete_session(session_id)
+
+    def get_setting(self, key: str) -> Any | None:
+        return self.target.get_setting(key)
+
+    def set_setting(self, key: str, value: Any) -> None:
+        self.target.set_setting(key, value)
+
+
+SCENARIOS: dict[str, dict[str, str]] = {
+    "scenario_1_loop": {
+        "label": "Tool Looping Scenario",
+        "description": "Agent repeatedly queries documentation with missing entity parameters",
+        "expected_duration": "< 1 sec",
+    },
+    "scenario_2_recovery": {
+        "label": "Tool Failure & Recovery",
+        "description": "Database outage simulation with credit limit calculation logic",
+        "expected_duration": "< 1 sec",
+    },
+    "live_langgraph_support": {
+        "label": "Live Customer Support Agent (Gemini)",
+        "description": "LangGraph agent querying database order value & refund policy via Gemini",
+        "expected_duration": "~4.5 sec",
+    },
+}
+
+
+class LiveRunRequest(BaseModel):
+    scenario_id: str
+    timeout_seconds: float | None = None
+    simulate_delay_seconds: float | None = None
+
+
+def _run_scenario_sync(
+    scenario_id: str, session_id: str, storage: Any, slow_delay: float = 0.0
+) -> None:
+    if slow_delay > 0:
+        time.sleep(slow_delay)
+
+    if scenario_id == "scenario_1_loop":
+        from agent_replay.interceptors.tool_interceptor import record_tool
+        from agent_replay.recorder import record_session
+        from agents.tools import search_docs
+
+        recorded_search = record_tool("search_docs")(search_docs)
+        with record_session(session_id, storage=storage):
+            for _ in range(10):
+                recorded_search(query="non_existent_feature_xyz")
+
+    elif scenario_id == "scenario_2_recovery":
+        from agent_replay.recorder import record_session
+        from scenarios.scenario_2_malformed_response import (
+            calculate_credit,
+            query_user_account,
+        )
+
+        with record_session(session_id, storage=storage):
+            account = query_user_account(user_id=101)
+            if account.get("status") != "error":
+                calculate_credit(account.get("balance"))
+
+    elif scenario_id == "live_langgraph_support":
+        from agent_replay.recorder import record_session
+        from agents.langgraph_agent import build_langgraph_agent
+
+        prompt = (
+            "Find Alice total order value from the database and tell me her refund "
+            "eligibility based on the refund policy."
+        )
+        agent = build_langgraph_agent()
+        with record_session(session_id, storage=storage, metadata={"prompt": prompt}):
+            agent.invoke({"messages": [{"role": "user", "content": prompt}]})
 
 
 class ReplayCallRequest(BaseModel):
@@ -281,6 +399,75 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
             "mode": request.mode,
             "events": results,
             "halted": any(event["status"] == "diverged" for event in results),
+        }
+
+    @app.get("/api/live/scenarios")
+    def get_live_scenarios() -> dict[str, Any]:
+        return SCENARIOS
+
+    @app.post("/api/live/run")
+    async def run_live_scenario(
+        request: LiveRunRequest,
+        x_demo_key: str | None = Header(None, alias="X-Demo-Key"),
+    ) -> dict[str, Any]:
+        expected_key = os.getenv("DEMO_API_KEY", DEMO_API_KEY)
+        if not x_demo_key or x_demo_key != expected_key:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-Demo-Key header")
+
+        if request.scenario_id not in SCENARIOS:
+            raise HTTPException(
+                status_code=400, detail=f"Unknown scenario_id '{request.scenario_id}'"
+            )
+
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        session_id = f"live_run_{request.scenario_id}_{timestamp}"
+        capped_storage = StepCappedStorage(actual_storage, max_steps=5)
+        timeout_sec = request.timeout_seconds if request.timeout_seconds is not None else 15.0
+
+        status = "done"
+        try:
+            if request.simulate_delay_seconds and request.simulate_delay_seconds > 0:
+                await asyncio.wait_for(
+                    asyncio.sleep(request.simulate_delay_seconds),
+                    timeout=timeout_sec,
+                )
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    _run_scenario_sync,
+                    request.scenario_id,
+                    session_id,
+                    capped_storage,
+                ),
+                timeout=timeout_sec,
+            )
+        except TimeoutError:
+            status = "timed_out"
+        except StepLimitExceeded:
+            status = "step_limit_reached"
+        except Exception as err:
+            status = f"error: {str(err)}"
+
+        details = session_service.get_session_details(session_id)
+        event_count = details["event_count"] if details else capped_storage.step_count
+        cost_usd = details["total_cost_usd"] if details else 0.0
+        cost_inr = round(cost_usd * USD_TO_INR, 4)
+
+        if status == "done":
+            msg = f"Completed successfully with {event_count} events."
+        elif status == "timed_out":
+            msg = f"Execution timed out after {timeout_sec}s ({event_count} events recorded)."
+        elif status == "step_limit_reached":
+            msg = f"Step limit of 5 reached ({event_count} events recorded)."
+        else:
+            msg = f"Execution finished with status: {status}"
+
+        return {
+            "session_id": session_id,
+            "status": status,
+            "event_count": event_count,
+            "total_cost_usd": cost_usd,
+            "total_cost_inr": cost_inr,
+            "message": msg,
         }
 
     if static_dir.exists():

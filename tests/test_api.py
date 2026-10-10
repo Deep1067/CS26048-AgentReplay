@@ -141,11 +141,7 @@ def test_api_updates_prices_in_inr(tmp_path, monkeypatch):
 
     res = test_client.put(
         "/api/prices",
-        json={
-            "models": {
-                "test-model": {"input_inr_per_1k": 8.3, "output_inr_per_1k": 16.6}
-            }
-        },
+        json={"models": {"test-model": {"input_inr_per_1k": 8.3, "output_inr_per_1k": 16.6}}},
     )
 
     assert res.status_code == 200
@@ -174,3 +170,59 @@ def test_api_updates_detector_config(tmp_path, monkeypatch):
 
     assert res.status_code == 200
     assert res.json() == update
+
+
+def test_api_get_live_scenarios(client):
+    res = client.get("/api/live/scenarios")
+    assert res.status_code == 200
+    scenarios = res.json()
+    assert "scenario_1_loop" in scenarios
+    assert "scenario_2_recovery" in scenarios
+    assert "live_langgraph_support" in scenarios
+
+
+def test_api_live_run_unauthorized(client):
+    # Missing header
+    res = client.post("/api/live/run", json={"scenario_id": "scenario_1_loop"})
+    assert res.status_code == 401
+
+    # Invalid header
+    res = client.post(
+        "/api/live/run",
+        json={"scenario_id": "scenario_1_loop"},
+        headers={"X-Demo-Key": "wrong_key"},
+    )
+    assert res.status_code == 401
+
+
+def test_api_live_run_success_and_step_cap(client):
+    from agent_replay.config import DEMO_API_KEY
+
+    res = client.post(
+        "/api/live/run",
+        json={"scenario_id": "scenario_1_loop"},
+        headers={"X-Demo-Key": DEMO_API_KEY},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "step_limit_reached"
+    assert data["event_count"] == 5
+    assert "live_run_scenario_1_loop_" in data["session_id"]
+
+
+def test_api_live_run_timeout(client):
+    from agent_replay.config import DEMO_API_KEY
+
+    res = client.post(
+        "/api/live/run",
+        json={
+            "scenario_id": "scenario_1_loop",
+            "timeout_seconds": 0.05,
+            "simulate_delay_seconds": 0.2,
+        },
+        headers={"X-Demo-Key": DEMO_API_KEY},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "timed_out"
+    assert "timed out after 0.05s" in data["message"]

@@ -759,3 +759,68 @@ body {
   text-transform: uppercase;
   margin-left: 8px;
 }
+
+/* Live Run Tab Styles */
+.live-run-toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  margin-top: 16px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.live-run-toolbar .control-group {
+  flex: 1;
+  min-width: 300px;
+}
+
+.live-run-status {
+  margin-top: 16px;
+  padding: 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.live-run-status.running {
+  background: var(--accent-blue-bg);
+  border: 1px solid var(--accent-blue);
+  color: var(--text-primary);
+}
+
+.live-run-status.done {
+  background: var(--accent-green-bg);
+  border: 1px solid var(--accent-green);
+  color: #a7f3d0;
+}
+
+.live-run-status.timed_out {
+  background: var(--accent-amber-bg);
+  border: 1px solid var(--accent-amber);
+  color: #fde68a;
+}
+
+.live-run-status.error {
+  background: var(--accent-red-bg);
+  border: 1px solid var(--accent-red);
+  color: #fca5a5;
+}
+
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--accent-blue);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
+.btn-link:hover {
+  color: #60a5fa;
+}
