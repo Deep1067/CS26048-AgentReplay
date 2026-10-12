@@ -58,10 +58,11 @@ def _extract_tokens(response: LLMResult) -> tuple[int, int]:
                 msg = getattr(gen, "message", None)
                 if msg and hasattr(msg, "usage_metadata") and msg.usage_metadata:
                     meta = msg.usage_metadata
-                    tokens_in = meta.get("input_tokens") or meta.get("prompt_token_count") or 0
-                    tokens_out = (
-                        meta.get("output_tokens") or meta.get("candidates_token_count") or 0
+                    getter = (
+                        meta.get if isinstance(meta, dict) else lambda key: getattr(meta, key, None)
                     )
+                    tokens_in = getter("input_tokens") or getter("prompt_token_count") or 0
+                    tokens_out = getter("output_tokens") or getter("candidates_token_count") or 0
                     break
     return int(tokens_in), int(tokens_out)
 
@@ -108,7 +109,9 @@ class ReplayModelCallbackHandler(BaseCallbackHandler):
         duration_ms = round((time.perf_counter() - run_data["t0"]) * 1000, 2)
         tokens_in, tokens_out = _extract_tokens(response)
         result_json = _serialize_generations(response.generations)
-        cost_usd = get_price_engine().calculate_cost(run_data["model_name"], tokens_in, tokens_out)
+        cost = get_price_engine().calculate_known_cost(
+            run_data["model_name"], tokens_in, tokens_out
+        )
 
         event = Event(
             session_id=run_data["session_id"],
@@ -121,7 +124,12 @@ class ReplayModelCallbackHandler(BaseCallbackHandler):
             duration_ms=duration_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
-            cost_usd=cost_usd,
+            cost_usd=cost or 0.0,
+            provider=run_data.get("provider"),
+            model=run_data["model_name"],
+            tokens_total=tokens_in + tokens_out,
+            cost_status="estimated" if cost is not None else "unavailable",
+            cost_currency="USD" if cost is not None else None,
         )
         storage.save_event(event)
 
@@ -189,7 +197,7 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
         except Exception:
             res_json = json.dumps(str(result))
 
-        cost_usd = get_price_engine().calculate_cost(model_name, tokens_in, tokens_out)
+        cost = get_price_engine().calculate_known_cost(model_name, tokens_in, tokens_out)
         event = Event(
             session_id=session_id,
             seq=0,
@@ -203,6 +211,10 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
             duration_ms=duration_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
-            cost_usd=cost_usd,
+            cost_usd=cost or 0.0,
+            model=model_name,
+            tokens_total=tokens_in + tokens_out,
+            cost_status="estimated" if cost is not None else "unavailable",
+            cost_currency="USD" if cost is not None else None,
         )
         storage.save_event(event)

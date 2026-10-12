@@ -12,4 +12,14 @@ DB_PATH = os.getenv("DB_PATH", str(PROJECT_ROOT / "agent_replay.db"))
 PRICES_PATH = os.getenv("PRICES_PATH", str(PROJECT_ROOT / "prices.json"))
 USD_TO_INR = float(os.getenv("USD_TO_INR", "83.0"))
 DETECTOR_CONFIG_PATH = os.getenv("DETECTOR_CONFIG_PATH", str(PROJECT_ROOT / "detector_config.json"))
-DEMO_API_KEY = os.getenv("DEMO_API_KEY", "demo_secret_key_123")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+LIVE_RUN_ENABLED = _env_flag("LIVE_RUN_ENABLED")
+CONFIG_MUTATIONS_ENABLED = _env_flag("CONFIG_MUTATIONS_ENABLED")

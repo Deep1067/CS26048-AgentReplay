@@ -1,25 +1,31 @@
 import asyncio
-import os
+import json
+import logging
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent_replay.config import DEMO_API_KEY, USD_TO_INR
+from agent_replay.config import CONFIG_MUTATIONS_ENABLED, LIVE_RUN_ENABLED, USD_TO_INR
 from agent_replay.detector.config import DetectorConfig
 from agent_replay.detector.engine import DetectorEngine
 from agent_replay.models import Event
 from agent_replay.pricing import get_price_engine
+from agent_replay.providers import call_provider, configured_providers
 from agent_replay.replay.engine import ReplayEngine
 from agent_replay.replay.exceptions import ReplayDivergenceError
-from agent_replay.session_service import SessionService
+from agent_replay.replay.experiment import run_counterfactual_experiment
+from agent_replay.session_service import SessionService, event_status
 from agent_replay.storage import SQLiteStorage
+
+logger = logging.getLogger(__name__)
 
 
 class StepLimitExceeded(Exception):
@@ -166,6 +172,12 @@ class DetectorConfigUpdate(BaseModel):
     max_events_per_session: int
 
 
+class PlaygroundRequest(BaseModel):
+    provider: Literal["openai", "anthropic", "gemini"]
+    prompt: str
+    model: str | None = None
+
+
 def _decode_json(value: str | None) -> Any:
     if value is None:
         return None
@@ -193,7 +205,12 @@ def _price_response() -> dict[str, Any]:
     return {"models": models, "usd_to_inr": USD_TO_INR}
 
 
-def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
+def create_app(
+    storage: SQLiteStorage | None = None,
+    *,
+    live_run_enabled: bool | None = None,
+    config_mutations_enabled: bool | None = None,
+) -> FastAPI:
     app = FastAPI(
         title="agent-replay",
         description="A logging proxy and replay engine for AI agent tool and model calls.",
@@ -209,6 +226,10 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
     )
 
     actual_storage = storage or SQLiteStorage()
+    allow_live_runs = LIVE_RUN_ENABLED if live_run_enabled is None else live_run_enabled
+    allow_config_mutations = (
+        CONFIG_MUTATIONS_ENABLED if config_mutations_enabled is None else config_mutations_enabled
+    )
     price_engine = get_price_engine()
     stored_prices = actual_storage.get_setting("prices")
     if isinstance(stored_prices, dict):
@@ -231,6 +252,160 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
         summaries = actual_storage.list_sessions()
         return [s.to_dict() for s in summaries]
 
+    @app.get("/api/overview")
+    def get_overview() -> dict[str, Any]:
+        summaries = actual_storage.list_sessions()
+        total_events = sum(item.event_count for item in summaries)
+        details = [session_service.get_session_details(item.session_id) for item in summaries]
+        model_events = [
+            event
+            for item in details
+            if item
+            for event in item["events"]
+            if event["type"] == "model_call"
+        ]
+        return {
+            "session_count": len(summaries),
+            "event_count": total_events,
+            "successful_events": sum(item["successful_events"] for item in details if item),
+            "failed_events": sum(item["failed_events"] for item in details if item),
+            "total_duration_ms": round(sum(item.total_duration_ms for item in summaries), 2),
+            "model_usage_available": any(
+                event["tokens_in"] or event["tokens_out"] for event in model_events
+            ),
+            "recent_sessions": [item.to_dict() for item in summaries[:5]],
+        }
+
+    @app.get("/api/providers")
+    def get_providers() -> dict[str, Any]:
+        return {"providers": configured_providers()}
+
+    @app.get("/api/usage")
+    def get_usage(
+        provider: str | None = Query(default=None, min_length=1),
+        model: str | None = Query(default=None, min_length=1),
+        session_id: str | None = Query(default=None, min_length=1),
+    ) -> dict[str, Any]:
+        grouped: dict[str, dict[str, Any]] = {}
+        sessions: list[dict[str, Any]] = []
+        for summary in actual_storage.list_sessions():
+            if session_id and summary.session_id != session_id:
+                continue
+            events = actual_storage.get_events(summary.session_id)
+            model_events = [
+                event
+                for event in events
+                if event.type == "model_call"
+                and (not provider or (event.provider or "unknown") == provider)
+                and (not model or (event.model or event.name) == model)
+            ]
+            if not model_events:
+                continue
+            for event in model_events:
+                key = f"{event.provider or 'unknown'}:{event.model or event.name}"
+                item = grouped.setdefault(
+                    key,
+                    {
+                        "provider": event.provider or "unknown",
+                        "model": event.model or event.name,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_usd": None,
+                        "cost_status": "unavailable",
+                        "sessions": 0,
+                    },
+                )
+                item["input_tokens"] += event.tokens_in
+                item["output_tokens"] += event.tokens_out
+                if event.cost_status != "unavailable":
+                    item["cost_usd"] = (item["cost_usd"] or 0.0) + event.cost_usd
+                    item["cost_status"] = event.cost_status
+                item["sessions"] = item["sessions"] + 1
+            available_cost = [
+                event.cost_usd for event in model_events if event.cost_status != "unavailable"
+            ]
+            sessions.append(
+                {
+                    "session_id": summary.session_id,
+                    "models": len(model_events),
+                    "input_tokens": sum(event.tokens_in for event in model_events),
+                    "output_tokens": sum(event.tokens_out for event in model_events),
+                    "cost_usd": round(sum(available_cost), 8) if available_cost else None,
+                    "cost_available": any(
+                        event.cost_status != "unavailable" for event in model_events
+                    ),
+                }
+            )
+        for item in grouped.values():
+            if item["cost_usd"] is not None:
+                item["cost_usd"] = round(item["cost_usd"], 8)
+        return {"groups": list(grouped.values()), "sessions": sessions}
+
+    @app.post("/api/playground/chat")
+    def playground_chat(request: PlaygroundRequest) -> dict[str, Any]:
+        if not request.prompt.strip():
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+        session_id = f"playground_{uuid.uuid4().hex[:12]}"
+        actual_storage.create_session(session_id, metadata={"provider": request.provider})
+        started_at = datetime.now(UTC).isoformat()
+        started = time.perf_counter()
+        try:
+            response = call_provider(request.provider, request.prompt, request.model)
+            usage = response.usage or {}
+            tokens_in = usage.get("input_tokens") or usage.get("prompt_tokens")
+            tokens_out = usage.get("output_tokens") or usage.get("completion_tokens")
+            cost = get_price_engine().calculate_known_cost(response.model, tokens_in, tokens_out)
+            actual_storage.save_event(
+                Event(
+                    session_id=session_id,
+                    seq=0,
+                    type="model_call",
+                    name=response.model,
+                    model=response.model,
+                    provider=response.provider,
+                    args_json=json.dumps({"prompt": request.prompt}),
+                    result_json=json.dumps({"text": response.text}),
+                    started_at=started_at,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                    tokens_in=tokens_in or 0,
+                    tokens_out=tokens_out or 0,
+                    tokens_total=(
+                        tokens_in + tokens_out
+                        if tokens_in is not None and tokens_out is not None
+                        else None
+                    ),
+                    cost_usd=cost or 0.0,
+                    cost_status="estimated" if cost is not None else "unavailable",
+                    cost_currency="USD" if cost is not None else None,
+                )
+            )
+            return {
+                "session_id": session_id,
+                "provider": response.provider,
+                "model": response.model,
+                "text": response.text,
+                "usage": response.usage,
+                "cost_usd": cost,
+                "cost_status": "estimated" if cost is not None else "unavailable",
+            }
+        except (RuntimeError, ValueError) as exc:
+            actual_storage.save_event(
+                Event(
+                    session_id=session_id,
+                    seq=0,
+                    type="model_call",
+                    name=request.model or request.provider,
+                    provider=request.provider,
+                    model=request.model,
+                    args_json=json.dumps({"prompt": request.prompt}),
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    started_at=started_at,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                )
+            )
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict[str, Any]:
         """Get full timeline events and aggregate totals for a specific session."""
@@ -238,6 +413,62 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
         if not details:
             raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
         return details
+
+    @app.get("/api/sessions/{session_id}/events")
+    def get_session_events(
+        session_id: str,
+        tool: str | None = Query(default=None, min_length=1, max_length=200),
+        status: Literal["success", "failed", "exception"] | None = None,
+        event_type: Literal["tool_call", "model_call"] | None = None,
+    ) -> dict[str, Any]:
+        """Return a filtered event timeline for one recorded session."""
+        if actual_storage.get_session(session_id) is None:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        events = actual_storage.get_events(session_id)
+        filtered = [
+            event
+            for event in events
+            if (tool is None or event.name == tool)
+            and (status is None or event_status(event) == status)
+            and (event_type is None or event.type == event_type)
+        ]
+        return {
+            "session_id": session_id,
+            "events": [
+                {
+                    **event.to_dict(),
+                    "status": event_status(event),
+                    "dependency": {
+                        "kind": "inferred_sequence",
+                        "predecessor_seq": event.seq - 1 if event.seq > 1 else None,
+                        "explicit": False,
+                    },
+                }
+                for event in filtered
+            ],
+        }
+
+    @app.get("/api/sessions/{session_id}/analytics")
+    def get_session_analytics(session_id: str) -> dict[str, Any]:
+        """Return summary analytics without requiring clients to process the full trace."""
+        details = session_service.get_session_details(session_id)
+        if not details:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        return {
+            key: details[key]
+            for key in (
+                "session_id",
+                "event_count",
+                "tool_calls_count",
+                "model_calls_count",
+                "successful_events",
+                "failed_events",
+                "total_duration_ms",
+                "slowest_event",
+                "tool_stats",
+                "metrics_available",
+            )
+        }
 
     @app.get("/api/prices")
     def get_prices() -> dict[str, Any]:
@@ -247,6 +478,11 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
     @app.put("/api/prices")
     def update_prices(update: PriceUpdate) -> dict[str, Any]:
         """Save INR per 1K pricing values back to prices.json."""
+        if not allow_config_mutations:
+            raise HTTPException(
+                status_code=403,
+                detail="Configuration changes are disabled on this server.",
+            )
         if any(
             rate.input_inr_per_1k < 0 or rate.output_inr_per_1k < 0
             for rate in update.models.values()
@@ -286,6 +522,11 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
 
     @app.put("/api/detector-config")
     def update_detector_config(update: DetectorConfigUpdate) -> dict[str, Any]:
+        if not allow_config_mutations:
+            raise HTTPException(
+                status_code=403,
+                detail="Configuration changes are disabled on this server.",
+            )
         values = update.model_dump()
         if (
             values["max_repeated_tool_calls"] < 1
@@ -401,18 +642,22 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
             "halted": any(event["status"] == "diverged" for event in results),
         }
 
+    @app.post("/api/experiments/counterfactual")
+    def run_counterfactual() -> dict[str, Any]:
+        """Run the deterministic local failure-and-recovery experiment."""
+        return run_counterfactual_experiment(actual_storage)
+
     @app.get("/api/live/scenarios")
     def get_live_scenarios() -> dict[str, Any]:
         return SCENARIOS
 
     @app.post("/api/live/run")
-    async def run_live_scenario(
-        request: LiveRunRequest,
-        x_demo_key: str | None = Header(None, alias="X-Demo-Key"),
-    ) -> dict[str, Any]:
-        expected_key = os.getenv("DEMO_API_KEY", DEMO_API_KEY)
-        if not x_demo_key or x_demo_key != expected_key:
-            raise HTTPException(status_code=401, detail="Invalid or missing X-Demo-Key header")
+    async def run_live_scenario(request: LiveRunRequest) -> dict[str, Any]:
+        if not allow_live_runs:
+            raise HTTPException(
+                status_code=503,
+                detail="Live execution is not enabled on this server.",
+            )
 
         if request.scenario_id not in SCENARIOS:
             raise HTTPException(
@@ -444,8 +689,13 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
             status = "timed_out"
         except StepLimitExceeded:
             status = "step_limit_reached"
-        except Exception as err:
-            status = f"error: {str(err)}"
+        except Exception:
+            logger.exception(
+                "Live scenario failed: scenario_id=%s session_id=%s",
+                request.scenario_id,
+                session_id,
+            )
+            status = "error"
 
         details = session_service.get_session_details(session_id)
         event_count = details["event_count"] if details else capped_storage.step_count
@@ -459,7 +709,7 @@ def create_app(storage: SQLiteStorage | None = None) -> FastAPI:
         elif status == "step_limit_reached":
             msg = f"Step limit of 5 reached ({event_count} events recorded)."
         else:
-            msg = f"Execution finished with status: {status}"
+            msg = "Execution failed; inspect the recorded session for details."
 
         return {
             "session_id": session_id,

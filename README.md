@@ -66,7 +66,10 @@ All interactions are captured in SQLite under the `events` table:
 | `duration_ms` | REAL | High-precision execution duration in milliseconds |
 | `tokens_in` | INTEGER | Input / prompt token count |
 | `tokens_out` | INTEGER | Output / candidate token count |
-| `cost_usd` | REAL | Calculated cost derived from `prices.json` |
+| `cost_usd` | REAL | Calculated cost when pricing and usage are known |
+| `provider`, `model` | TEXT | Provider and resolved model, when available |
+| `tokens_total`, `cached_tokens` | INTEGER | Usage totals and cached-token metadata, when reported |
+| `cost_status` | TEXT | `actual`, `estimated`, or `unavailable` |
 
 ---
 
@@ -84,11 +87,20 @@ cd D:\agent-replay
 pip install -r requirements.txt
 ```
 
-Set up your Gemini API Key in `.env`:
+Provider-backed Playground calls are optional. Set only the provider key(s) you intend to use in
+`.env`; keys are read server-side and are never stored in sessions or sent to the browser:
 ```env
 GEMINI_API_KEY=AIzaSy...
-DEFAULT_MODEL=gemini-3.8-flash
+DEFAULT_MODEL=gemini-2.0-flash
+# OPENAI_API_KEY=
+# ANTHROPIC_API_KEY=
 ```
+
+The dashboard remains useful without any provider key: local recording, strict replay,
+counterfactual experiments, timeline inspection, and analytics do not make paid network calls.
+The AI Playground calls a provider only after the user submits a prompt. Provider responses and
+prompts are recorded in the selected session for debugging, so do not submit secrets or personal
+data. Usage and cost displays label unavailable pricing instead of treating it as zero.
 
 Configure or customize token prices in `prices.json`:
 ```json
@@ -122,9 +134,11 @@ Run an end-to-end failure, strict reproduction, and recovery test:
 python scenarios/scenario_2_malformed_response.py
 ```
 **Outcome**:
-1. **Live Failure**: The database tool fails with a simulated timeout error.
-2. **Strict Replay**: Re-runs the exact agent workflow deterministically with **zero live API or database calls ($0 cost)**.
-3. **Forked Replay**: Substitutes the failed response at sequence #1 with valid account data (`{"status": "ok", "balance": 500.0}`). Downstream model and tool calls resume live and successfully complete!
+1. **Baseline Failure**: The deterministic account tool returns an error payload and the workflow halts; the failed response is persisted in the timeline.
+2. **Strict Runtime Replay**: Runs the decorated workflow against stored responses without invoking the underlying tool.
+3. **Forked Runtime Execution**: Substitutes sequence #1 with valid account data (`{"status": "ok", "balance": 500.0}`), then executes the real downstream `calculate_credit` tool and persists a separate fork session.
+
+To run the complete comparison through the UI, start the server and open the **Experiment** tab, then choose **Run experiment**. The result identifies the parent and fork sessions, outcomes, substituted event, and changed/added/removed events. Duration is the recorded local wall-clock timing for this synthetic scenario, not a provider performance benchmark. `POST /api/replay` remains trace validation only; it does not re-execute an agent workflow.
 
 ---
 
@@ -142,6 +156,10 @@ Open your browser to: **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
 - **Flagged Badges**: Warning and Danger alert banners for anomaly sessions.
 - **Chronological Timeline**: Step-by-step visual cards with duration badges, cost pills, and collapsible JSON payloads for both inputs and outputs.
 - **Culprit Highlighting**: Cards identified by anomaly rules glow with red borders and `[FLAGGED]` pills.
+- **Model Usage & Costs**: Filter recorded model usage by provider, model, and session. Costs are
+  marked unavailable when token usage or an explicit model rate is missing.
+- **AI Playground**: Exercise configured OpenAI, Anthropic, or Gemini adapters from the server,
+  with failed provider calls recorded as failed sessions.
 
 ## ☁️ Vercel Deployment
 
@@ -153,9 +171,13 @@ TURSO_AUTH_TOKEN
 GEMINI_API_KEY
 DEFAULT_MODEL
 USD_TO_INR
+LIVE_RUN_ENABLED
+CONFIG_MUTATIONS_ENABLED
 ```
 
 Import `Deep1067/CS26048-AgentReplay` into Vercel with the repository root as the project directory. The first application startup creates the required sessions, events, and settings tables automatically. Pricing and detector settings are stored in the database when Turso is configured; local development continues to use SQLite and local configuration files.
+
+`LIVE_RUN_ENABLED` and `CONFIG_MUTATIONS_ENABLED` default to `false`. Set them to `true` only in a trusted local environment; the application does not use a browser-visible shared secret for authorization. The deterministic scenarios can still be run directly with the commands above when live execution is disabled.
 
 ---
 

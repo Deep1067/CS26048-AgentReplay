@@ -25,6 +25,19 @@
   </header>
 
   <div class="app-layout">
+    <div id="sidebar-overlay" class="sidebar-overlay" hidden></div>
+    <aside class="app-sidebar" id="app-sidebar">
+      <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Collapse navigation">☰</button>
+      <nav class="sidebar-nav" aria-label="Primary navigation">
+        <button class="sidebar-link active" data-tab="overview"><span>⌂</span><b>Overview</b></button>
+        <button class="sidebar-link" data-tab="timeline"><span>◌</span><b>Observability / Traces</b></button>
+        <button class="sidebar-link" data-tab="sessions"><span>▤</span><b>Recorded Sessions</b></button>
+        <button class="sidebar-link" data-tab="replay"><span>↪</span><b>Replay & Fork</b></button>
+        <button class="sidebar-link" data-tab="experiment"><span>◇</span><b>Experiments</b></button>
+        <button class="sidebar-link" data-tab="cost"><span>$</span><b>Model Usage & Costs</b></button>
+        <button class="sidebar-link" data-tab="playground"><span>✦</span><b>AI Playground</b></button>
+      </nav>
+    </aside>
     <!-- Left Sidebar: Session List -->
     <aside class="sidebar">
       <div class="sidebar-header">
@@ -41,8 +54,9 @@
       <nav class="tab-bar" aria-label="Workspace views">
         <button class="tab-btn active" data-tab="timeline" aria-selected="true">Timeline</button>
         <button class="tab-btn" data-tab="replay" aria-selected="false">Replay</button>
+        <button class="tab-btn" data-tab="experiment" aria-selected="false">Experiment</button>
         <button class="tab-btn" data-tab="live" aria-selected="false">Live run</button>
-        <button class="tab-btn" data-tab="cost" aria-selected="false">Cost and pricing</button>
+        <button class="tab-btn" data-tab="cost" aria-selected="false">Model usage & costs</button>
         <button class="tab-btn" data-tab="detector" aria-selected="false">Detector rules</button>
       </nav>
 
@@ -61,20 +75,49 @@
             <span id="metric-session-id" class="metric-value mono">sess_...</span>
           </div>
           <div class="metric-card">
-            <span class="metric-label">Total Cost</span>
-            <span id="metric-cost" class="metric-value highlight-green">$0.000000</span>
+            <span class="metric-label">Successful / Failed</span>
+            <span id="metric-outcomes" class="metric-value">N/A</span>
           </div>
           <div class="metric-card">
             <span class="metric-label">Total Duration</span>
-            <span id="metric-duration" class="metric-value">0 ms</span>
+            <span id="metric-duration" class="metric-value">N/A</span>
           </div>
           <div class="metric-card">
             <span class="metric-label">Total Events</span>
             <span id="metric-events" class="metric-value">0</span>
           </div>
           <div class="metric-card">
-            <span class="metric-label">Total Tokens (In / Out)</span>
-            <span id="metric-tokens" class="metric-value">0 / 0</span>
+            <span class="metric-label">Slowest Event</span>
+            <span id="metric-slowest" class="metric-value">N/A</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Recorded Cost</span>
+            <span id="metric-cost" class="metric-value highlight-green">N/A</span>
+          </div>
+        </section>
+
+        <section id="tab-overview" class="tab-panel" data-panel="overview" hidden>
+          <div class="panel-card">
+            <h2>Overview</h2>
+            <p class="text-muted">Local recording health and recent activity from the AgentReplay database.</p>
+            <div id="overview-metrics" class="metrics-grid"></div>
+            <h3 class="section-heading">Recent sessions</h3>
+            <div id="overview-recent" class="overview-list"><p class="text-muted">Loading overview...</p></div>
+          </div>
+        </section>
+
+        <section id="tab-playground" class="tab-panel" data-panel="playground" hidden>
+          <div class="panel-card playground-panel">
+            <h2>AI Playground</h2>
+            <p class="text-muted">Provider calls happen only when you submit. API keys remain server-side and are never recorded.</p>
+            <div id="provider-notice" class="notice-panel">Loading provider configuration...</div>
+            <div id="playground-messages" class="playground-messages"></div>
+            <form id="playground-form" class="playground-form">
+              <select id="playground-provider" class="select-input" aria-label="Provider"></select>
+              <input id="playground-model" class="text-input" placeholder="Model (optional)">
+              <textarea id="playground-prompt" class="prompt-input" rows="4" placeholder="Ask a configured provider..." required></textarea>
+              <div class="playground-actions"><button id="playground-send" class="btn btn-primary" type="submit">Send</button><button id="playground-reset" class="btn btn-secondary" type="button">Reset</button></div>
+            </form>
           </div>
         </section>
 
@@ -85,10 +128,27 @@
             <span id="timeline-subtitle" class="text-muted">Chronological order of calls</span>
           </div>
           <div class="filter-group">
+            <input id="event-search" class="search-input timeline-search" type="search" placeholder="Search tool or event">
+            <select id="event-status-filter" class="select-input compact-select">
+              <option value="all">All statuses</option>
+              <option value="success">Successful</option>
+              <option value="failed">Failed</option>
+              <option value="exception">Exceptions</option>
+            </select>
             <button class="filter-btn active" data-filter="all">All</button>
             <button class="filter-btn" data-filter="tool_call">Tools Only</button>
             <button class="filter-btn" data-filter="model_call">Models Only</button>
           </div>
+        </div>
+
+        <div class="analytics-strip">
+          <div>
+            <span class="metric-label">Tool activity</span>
+            <div id="tool-stats" class="tool-stats"></div>
+          </div>
+          <p id="dependency-note" class="text-muted">
+            Dependency view: sequence order only. Explicit parent-child relationships are not recorded.
+          </p>
         </div>
 
         <!-- Timeline Events Container -->
@@ -122,6 +182,20 @@
         </div>
       </section>
 
+      <section id="tab-experiment" class="tab-panel" data-panel="experiment" hidden>
+        <div class="panel-card">
+          <h2>Deterministic counterfactual experiment</h2>
+          <p class="text-muted">
+            Runs the local failure workflow, strict replay, and a fork that substitutes the
+            account response. No model provider is used.
+          </p>
+          <button id="run-experiment-btn" class="btn btn-primary">Run experiment</button>
+          <div id="experiment-results" class="replay-results">
+            <p class="text-muted">Run the experiment to compare the baseline and fork.</p>
+          </div>
+        </div>
+      </section>
+
       <section id="tab-live" class="tab-panel" data-panel="live" hidden>
         <div class="panel-card">
           <h2>Live Run</h2>
@@ -141,7 +215,42 @@
 
       <section id="tab-cost" class="tab-panel" data-panel="cost" hidden>
         <div class="panel-card">
-          <h2>Cost and pricing</h2>
+          <h2>Model usage & costs</h2>
+          <div class="usage-filters">
+            <label class="control-group">
+              <span class="metric-label">Provider</span>
+              <select id="usage-provider-filter" class="select-input">
+                <option value="">All providers</option>
+              </select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Model</span>
+              <select id="usage-model-filter" class="select-input">
+                <option value="">All models</option>
+              </select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Session</span>
+              <select id="usage-session-filter" class="select-input">
+                <option value="">All sessions</option>
+              </select>
+            </label>
+          </div>
+          <div id="usage-summary" class="usage-summary"><p class="text-muted">Loading recorded model usage...</p></div>
+          <div class="table-scroll">
+            <table class="pricing-table usage-table">
+              <thead>
+                <tr>
+                  <th>Provider / model</th>
+                  <th>Sessions</th>
+                  <th>Input tokens</th>
+                  <th>Output tokens</th>
+                  <th>Cost</th>
+                </tr>
+              </thead>
+              <tbody id="usage-table-body"></tbody>
+            </table>
+          </div>
           <p id="pricing-exchange-note" class="text-muted"></p>
           <div class="table-scroll">
             <table class="pricing-table">

@@ -84,6 +84,16 @@ class SQLiteStorage:
                 }
                 if "error_type" not in columns:
                     self._conn.execute("ALTER TABLE events ADD COLUMN error_type TEXT;")
+                for column, definition in {
+                    "provider": "TEXT",
+                    "model": "TEXT",
+                    "tokens_total": "INTEGER",
+                    "cached_tokens": "INTEGER",
+                    "cost_status": "TEXT NOT NULL DEFAULT 'unavailable'",
+                    "cost_currency": "TEXT",
+                }.items():
+                    if column not in columns:
+                        self._conn.execute(f"ALTER TABLE events ADD COLUMN {column} {definition};")
                 self._conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_events_session_seq
                     ON events (session_id, seq);
@@ -139,8 +149,9 @@ class SQLiteStorage:
                     """
                     INSERT INTO events (
                         session_id, seq, type, name, args_json, result_json, error, error_type,
-                        started_at, duration_ms, tokens_in, tokens_out, cost_usd
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        started_at, duration_ms, tokens_in, tokens_out, cost_usd,
+                        provider, model, tokens_total, cached_tokens, cost_status, cost_currency
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                     (
                         event.session_id,
@@ -156,6 +167,12 @@ class SQLiteStorage:
                         event.tokens_in,
                         event.tokens_out,
                         event.cost_usd,
+                        event.provider,
+                        event.model,
+                        event.tokens_total,
+                        event.cached_tokens,
+                        event.cost_status,
+                        event.cost_currency,
                     ),
                 )
         return event
@@ -165,7 +182,8 @@ class SQLiteStorage:
             cursor = self._conn.execute(
                 """
                      SELECT session_id, seq, type, name, args_json, result_json, error,
-                         error_type, started_at, duration_ms, tokens_in, tokens_out, cost_usd
+                         error_type, started_at, duration_ms, tokens_in, tokens_out, cost_usd,
+                         provider, model, tokens_total, cached_tokens, cost_status, cost_currency
             FROM events
             WHERE session_id = ?
             ORDER BY seq ASC;
@@ -189,6 +207,16 @@ class SQLiteStorage:
                         tokens_in=row["tokens_in"],
                         tokens_out=row["tokens_out"],
                         cost_usd=row["cost_usd"],
+                        provider=row["provider"],
+                        model=row["model"],
+                        tokens_total=row["tokens_total"],
+                        cached_tokens=row["cached_tokens"],
+                        cost_status=(
+                            "estimated"
+                            if row["cost_status"] in (None, "unavailable") and row["cost_usd"]
+                            else (row["cost_status"] or "unavailable")
+                        ),
+                        cost_currency=row["cost_currency"],
                     )
                 )
             return events
@@ -251,6 +279,20 @@ class SQLiteStorage:
                 total_duration_ms=round(row["total_duration_ms"], 2),
                 has_errors=bool(row["has_errors"]),
             )
+
+    def get_session_metadata(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata_json FROM sessions WHERE session_id = ?;",
+                (session_id,),
+            ).fetchone()
+        if not row or not row["metadata_json"]:
+            return {}
+        try:
+            metadata = json.loads(row["metadata_json"])
+        except (TypeError, ValueError):
+            return {}
+        return metadata if isinstance(metadata, dict) else {}
 
     def delete_session(self, session_id: str) -> None:
         with self._lock:
