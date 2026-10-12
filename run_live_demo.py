@@ -55,8 +55,7 @@ def main() -> int:
         f"({details['tool_calls_count']} tool calls, {details['model_calls_count']} model calls)"
     )
     print(
-        f"  Total tokens    : {details['total_tokens_in']} in / "
-        f"{details['total_tokens_out']} out"
+        f"  Total tokens    : {details['total_tokens_in']} in / {details['total_tokens_out']} out"
     )
     print(f"  Total cost      : ${details['total_cost_usd']:.6f}")
     print(f"  Total duration  : {details['total_duration_ms']:.0f} ms")

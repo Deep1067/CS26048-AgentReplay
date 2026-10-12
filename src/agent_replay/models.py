@@ -17,6 +17,12 @@ class Event:
     tokens_in: int = 0
     tokens_out: int = 0
     cost_usd: float = 0.0
+    provider: str | None = None
+    model: str | None = None
+    tokens_total: int | None = None
+    cached_tokens: int | None = None
+    cost_status: Literal["actual", "estimated", "unavailable"] = "unavailable"
+    cost_currency: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -29,9 +29,7 @@ class SQLiteStorage:
             raw_path = str(db_path or DB_PATH)
             self.is_memory = raw_path == ":memory:" or "mode=memory" in raw_path
             self.db_path = (
-                f"file:mem_{id(self)}?mode=memory&cache=shared"
-                if self.is_memory
-                else raw_path
+                f"file:mem_{id(self)}?mode=memory&cache=shared" if self.is_memory else raw_path
             )
             self.use_uri = self.is_memory
             self._conn = sqlite3.connect(
@@ -86,6 +84,16 @@ class SQLiteStorage:
                 }
                 if "error_type" not in columns:
                     self._conn.execute("ALTER TABLE events ADD COLUMN error_type TEXT;")
+                for column, definition in {
+                    "provider": "TEXT",
+                    "model": "TEXT",
+                    "tokens_total": "INTEGER",
+                    "cached_tokens": "INTEGER",
+                    "cost_status": "TEXT NOT NULL DEFAULT 'unavailable'",
+                    "cost_currency": "TEXT",
+                }.items():
+                    if column not in columns:
+                        self._conn.execute(f"ALTER TABLE events ADD COLUMN {column} {definition};")
                 self._conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_events_session_seq
                     ON events (session_id, seq);
@@ -119,20 +127,31 @@ class SQLiteStorage:
         return int(cursor.fetchone()[0])
 
     def save_event(self, event: Event) -> Event:
-        self.create_session(event.session_id)
         if not event.started_at:
             event.started_at = datetime.now(UTC).isoformat()
 
         with self._lock:
-            if event.seq <= 0:
-                event.seq = self.get_next_seq(event.session_id)
             with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (session_id, started_at, metadata_json)
+                    VALUES (?, ?, ?);
+                    """,
+                    (event.session_id, event.started_at, "{}"),
+                )
+                if event.seq <= 0:
+                    cursor = self._conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?;",
+                        (event.session_id,),
+                    )
+                    event.seq = int(cursor.fetchone()[0])
                 self._conn.execute(
                     """
                     INSERT INTO events (
                         session_id, seq, type, name, args_json, result_json, error, error_type,
-                        started_at, duration_ms, tokens_in, tokens_out, cost_usd
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        started_at, duration_ms, tokens_in, tokens_out, cost_usd,
+                        provider, model, tokens_total, cached_tokens, cost_status, cost_currency
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                     (
                         event.session_id,
@@ -148,6 +167,12 @@ class SQLiteStorage:
                         event.tokens_in,
                         event.tokens_out,
                         event.cost_usd,
+                        event.provider,
+                        event.model,
+                        event.tokens_total,
+                        event.cached_tokens,
+                        event.cost_status,
+                        event.cost_currency,
                     ),
                 )
         return event
@@ -155,15 +180,16 @@ class SQLiteStorage:
     def get_events(self, session_id: str) -> list[Event]:
         with self._lock:
             cursor = self._conn.execute(
-            """
+                """
                      SELECT session_id, seq, type, name, args_json, result_json, error,
-                         error_type, started_at, duration_ms, tokens_in, tokens_out, cost_usd
+                         error_type, started_at, duration_ms, tokens_in, tokens_out, cost_usd,
+                         provider, model, tokens_total, cached_tokens, cost_status, cost_currency
             FROM events
             WHERE session_id = ?
             ORDER BY seq ASC;
         """,
-            (session_id,),
-        )
+                (session_id,),
+            )
             events = []
             for row in cursor.fetchall():
                 events.append(
@@ -181,6 +207,16 @@ class SQLiteStorage:
                         tokens_in=row["tokens_in"],
                         tokens_out=row["tokens_out"],
                         cost_usd=row["cost_usd"],
+                        provider=row["provider"],
+                        model=row["model"],
+                        tokens_total=row["tokens_total"],
+                        cached_tokens=row["cached_tokens"],
+                        cost_status=(
+                            "estimated"
+                            if row["cost_status"] in (None, "unavailable") and row["cost_usd"]
+                            else (row["cost_status"] or "unavailable")
+                        ),
+                        cost_currency=row["cost_currency"],
                     )
                 )
             return events
@@ -217,7 +253,7 @@ class SQLiteStorage:
     def get_session(self, session_id: str) -> SessionSummary | None:
         with self._lock:
             cursor = self._conn.execute(
-            """
+                """
             SELECT
                 s.session_id,
                 s.started_at,
@@ -230,8 +266,8 @@ class SQLiteStorage:
             WHERE s.session_id = ?
             GROUP BY s.session_id, s.started_at;
         """,
-            (session_id,),
-        )
+                (session_id,),
+            )
             row = cursor.fetchone()
             if not row:
                 return None
@@ -243,6 +279,20 @@ class SQLiteStorage:
                 total_duration_ms=round(row["total_duration_ms"], 2),
                 has_errors=bool(row["has_errors"]),
             )
+
+    def get_session_metadata(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata_json FROM sessions WHERE session_id = ?;",
+                (session_id,),
+            ).fetchone()
+        if not row or not row["metadata_json"]:
+            return {}
+        try:
+            metadata = json.loads(row["metadata_json"])
+        except (TypeError, ValueError):
+            return {}
+        return metadata if isinstance(metadata, dict) else {}
 
     def delete_session(self, session_id: str) -> None:
         with self._lock:

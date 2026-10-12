@@ -39,6 +39,31 @@ class PriceEngine:
             "default", {"input_cost_per_million": 0.10, "output_cost_per_million": 0.40}
         )
 
+    def find_model_rates(self, model_name: str) -> dict[str, float] | None:
+        """Return rates only for an explicitly configured model or alias."""
+        clean_name = model_name.lower().replace("models/", "").strip()
+        if clean_name in self.prices and clean_name != "default":
+            return self.prices[clean_name]
+        for key, rates in self.prices.items():
+            if key != "default" and (key in clean_name or clean_name in key):
+                return rates
+        return None
+
+    def calculate_known_cost(
+        self, model_name: str, tokens_in: int | None, tokens_out: int | None
+    ) -> float | None:
+        rates = self.find_model_rates(model_name)
+        if rates is None or tokens_in is None or tokens_out is None:
+            return None
+        return round(
+            (
+                tokens_in * rates.get("input_cost_per_million", 0.0)
+                + tokens_out * rates.get("output_cost_per_million", 0.0)
+            )
+            / 1_000_000.0,
+            8,
+        )
+
     def calculate_cost(self, model_name: str, tokens_in: int, tokens_out: int) -> float:
         rates = self._match_model(model_name)
         cost_in = (tokens_in * rates.get("input_cost_per_million", 0.0)) / 1_000_000.0
