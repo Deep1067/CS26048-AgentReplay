@@ -1,6 +1,7 @@
 document.addEventListener("DOMContentLoaded", () => {
   let allSessions = [];
   let currentSessionData = null;
+  let currentExperimentId = null;
   let currentFilter = "all";
   let liveMonitorTimer = null;
   let liveExecutionEnabled = false;
@@ -36,6 +37,10 @@ document.addEventListener("DOMContentLoaded", () => {
   const experimentEventSelect = document.getElementById("experiment-event-select");
   const experimentResultInput = document.getElementById("experiment-result-input");
   const experimentHistoryEl = document.getElementById("experiment-history");
+  const experimentEvaluationCriteria = document.getElementById("experiment-evaluation-criteria");
+  const evaluateExperimentBtn = document.getElementById("evaluate-experiment-btn");
+  const experimentEvaluationResults = document.getElementById("experiment-evaluation-results");
+  const experimentEvaluationHistory = document.getElementById("experiment-evaluation-history");
   const pricingExchangeNote = document.getElementById("pricing-exchange-note");
   const pricingTableBody = document.getElementById("pricing-table-body");
   const savePricingBtn = document.getElementById("save-pricing-btn");
@@ -66,6 +71,11 @@ document.addEventListener("DOMContentLoaded", () => {
   const playgroundMessages = document.getElementById("playground-messages");
   const providerNotice = document.getElementById("provider-notice");
   const playgroundSend = document.getElementById("playground-send");
+  const playgroundEvaluationSession = document.getElementById("playground-evaluation-session");
+  const playgroundEvaluationCriteria = document.getElementById("playground-evaluation-criteria");
+  const evaluateRecordedSessionBtn = document.getElementById("evaluate-recorded-session-btn");
+  const playgroundEvaluationResults = document.getElementById("playground-evaluation-results");
+  const playgroundEvaluationHistory = document.getElementById("playground-evaluation-history");
   const usageProviderFilter = document.getElementById("usage-provider-filter");
   const usageModelFilter = document.getElementById("usage-model-filter");
   const usageSessionFilter = document.getElementById("usage-session-filter");
@@ -75,6 +85,24 @@ document.addEventListener("DOMContentLoaded", () => {
     if (status === "unavailable" || value == null) return "Unavailable";
     const prefix = status === "estimated" ? "≈ " : "";
     return `${prefix}$${Number(value).toFixed(8)} (${status})`;
+  }
+
+  function populateEvaluationSessions(sessions) {
+    const selected = currentSessionData?.session_id || playgroundEvaluationSession.value;
+    playgroundEvaluationSession.replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Choose a recorded session";
+    playgroundEvaluationSession.appendChild(placeholder);
+    sessions.forEach(session => {
+      const option = document.createElement("option");
+      option.value = session.session_id;
+      option.textContent = `${session.session_id} · ${session.event_count} events`;
+      playgroundEvaluationSession.appendChild(option);
+    });
+    if ([...playgroundEvaluationSession.options].some(option => option.value === selected)) {
+      playgroundEvaluationSession.value = selected;
+    }
   }
 
   function switchTab(tabName) {
@@ -104,6 +132,144 @@ document.addEventListener("DOMContentLoaded", () => {
       mobileNavToggle.setAttribute("aria-expanded", "false");
       mobileNavToggle.setAttribute("aria-label", "Open navigation");
     }
+
+    function parseEvaluationCriteria(input) {
+      let criteria;
+      try {
+        criteria = JSON.parse(input.value);
+      } catch (_) {
+        throw new Error("Evaluation criteria must be valid JSON.");
+      }
+      if (!criteria || typeof criteria !== "object" || Array.isArray(criteria)) {
+        throw new Error("Evaluation criteria must be a JSON object.");
+      }
+      return criteria;
+    }
+
+    function renderEvaluation(container, record) {
+      const output = document.createElement("pre");
+      output.className = "code-block";
+      output.textContent = JSON.stringify(record, null, 2);
+      container.replaceChildren(output);
+    }
+
+    async function fetchExperimentEvaluations(experimentId) {
+      try {
+        const response = await fetch(
+          `/api/experiments/${encodeURIComponent(experimentId)}/evaluations`
+        );
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Unable to load evaluation history.");
+        experimentEvaluationHistory.replaceChildren();
+        if (!data.evaluations.length) {
+          experimentEvaluationHistory.textContent = "No evaluations saved for this comparison.";
+          return;
+        }
+        data.evaluations.forEach(record => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "overview-session";
+          button.textContent = `${record.evaluated_at} · ${record.result.status}`;
+          button.addEventListener("click", () => {
+            experimentEvaluationCriteria.value = JSON.stringify(record.criteria, null, 2);
+            renderEvaluation(experimentEvaluationResults, record);
+          });
+          experimentEvaluationHistory.appendChild(button);
+        });
+      } catch (err) {
+        experimentEvaluationHistory.textContent = `Unable to load evaluation history: ${err.message}`;
+      }
+    }
+
+    evaluateExperimentBtn.addEventListener("click", async () => {
+      if (!currentExperimentId) return;
+      evaluateExperimentBtn.disabled = true;
+      try {
+        const criteria = parseEvaluationCriteria(experimentEvaluationCriteria);
+        experimentEvaluationResults.textContent = "Evaluating the recorded baseline and fork...";
+        const response = await fetch(
+          `/api/experiments/${encodeURIComponent(currentExperimentId)}/evaluations`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ criteria }),
+          }
+        );
+        const record = await response.json();
+        if (!response.ok) throw new Error(record.detail || "Evaluation failed.");
+        renderEvaluation(experimentEvaluationResults, record);
+        await fetchExperimentEvaluations(currentExperimentId);
+      } catch (err) {
+        experimentEvaluationResults.textContent = `Evaluation failed: ${err.message}`;
+      } finally {
+        evaluateExperimentBtn.disabled = !currentExperimentId;
+      }
+    });
+
+    evaluateRecordedSessionBtn.addEventListener("click", async () => {
+      const sessionId = playgroundEvaluationSession.value;
+      if (!sessionId) {
+        playgroundEvaluationResults.textContent = "Select a recorded session to evaluate.";
+        return;
+      }
+      evaluateRecordedSessionBtn.disabled = true;
+      try {
+        const criteria = parseEvaluationCriteria(playgroundEvaluationCriteria);
+        playgroundEvaluationResults.textContent = "Evaluating the recorded output; no provider call will be made...";
+        const response = await fetch(
+          `/api/evaluations/sessions/${encodeURIComponent(sessionId)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ criteria }),
+          }
+        );
+        const record = await response.json();
+        if (!response.ok) throw new Error(record.detail || "Evaluation failed.");
+        renderEvaluation(playgroundEvaluationResults, record);
+        await fetchSessionEvaluationHistory(sessionId);
+      } catch (err) {
+        playgroundEvaluationResults.textContent = `Evaluation failed: ${err.message}`;
+      } finally {
+        evaluateRecordedSessionBtn.disabled = false;
+      }
+    });
+
+    async function fetchSessionEvaluationHistory(sessionId) {
+      playgroundEvaluationHistory.replaceChildren();
+      if (!sessionId) {
+        playgroundEvaluationHistory.textContent = "Select a session to view saved evaluations.";
+        return;
+      }
+      try {
+        const response = await fetch(
+          `/api/evaluations?session_id=${encodeURIComponent(sessionId)}`
+        );
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Unable to load session evaluations.");
+        if (!data.evaluations.length) {
+          playgroundEvaluationHistory.textContent = "No saved evaluations for this session.";
+          return;
+        }
+        data.evaluations.forEach(record => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "overview-session";
+          button.textContent = `${record.evaluated_at} · ${record.result.status}`;
+          button.addEventListener("click", () => {
+            playgroundEvaluationCriteria.value = JSON.stringify(record.criteria, null, 2);
+            renderEvaluation(playgroundEvaluationResults, record);
+          });
+          playgroundEvaluationHistory.appendChild(button);
+        });
+      } catch (err) {
+        playgroundEvaluationHistory.textContent = `Unable to load evaluation history: ${err.message}`;
+      }
+    }
+
+    playgroundEvaluationSession.addEventListener("change", () => {
+      fetchSessionEvaluationHistory(playgroundEvaluationSession.value);
+    });
     if (tabName === "overview") fetchOverview();
     if (tabName === "playground") fetchProviders();
     if (tabName === "experiment") {
@@ -282,8 +448,16 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!response.ok) throw new Error(data.detail || "Provider request failed.");
         const assistant = document.createElement("div");
         assistant.className = "chat-message assistant";
-        assistant.textContent = `${data.text}\n\nUsage: ${data.usage ? JSON.stringify(data.usage) : "Unavailable"} · Cost: ${data.cost_usd ?? "Unavailable"}`;
+        assistant.textContent = `${data.text}\n\nSource: ${data.output_source} · Session: ${data.session_id}\nUsage: ${data.usage ? JSON.stringify(data.usage) : "Unavailable"} · Cost: ${data.cost_usd ?? "Unavailable"}`;
         playgroundMessages.appendChild(assistant);
+        if (![...playgroundEvaluationSession.options].some(option => option.value === data.session_id)) {
+          const option = document.createElement("option");
+          option.value = data.session_id;
+          option.textContent = `${data.session_id} · Playground provider call`;
+          playgroundEvaluationSession.appendChild(option);
+        }
+        playgroundEvaluationSession.value = data.session_id;
+        fetchSessionEvaluationHistory(data.session_id);
         playgroundPrompt.value = "";
       } catch (err) {
         providerNotice.textContent = err.message;
@@ -570,6 +744,8 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function renderExperiment(data) {
+    currentExperimentId = data.experiment_id;
+    evaluateExperimentBtn.disabled = false;
     experimentResultsEl.replaceChildren();
     const summary = document.createElement("pre");
     summary.className = "code-block";
@@ -603,6 +779,7 @@ document.addEventListener("DOMContentLoaded", () => {
       ),
     ].join("\n");
     experimentResultsEl.appendChild(summary);
+    fetchExperimentEvaluations(data.experiment_id);
 
     [data.parent_session_id, data.fork_session_id].forEach(sessionId => {
       const button = document.createElement("button");
@@ -740,6 +917,8 @@ document.addEventListener("DOMContentLoaded", () => {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Experiment failed");
       renderExperiment(data);
+      experimentEvaluationResults.textContent =
+        "Comparison created. Evaluate both recorded outputs with the criteria above.";
       await fetchSessions();
       await fetchExperimentHistory();
     } catch (err) {
@@ -760,6 +939,7 @@ document.addEventListener("DOMContentLoaded", () => {
       allSessions = await res.json();
       sessionCountBadge.textContent = `${allSessions.length} Sessions`;
       populateReplaySessions(allSessions);
+      populateEvaluationSessions(allSessions);
       renderSessionsList(allSessions);
     } catch (err) {
       sessionsListEl.textContent = `Error: ${err.message}`;
@@ -813,6 +993,10 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!res.ok) throw new Error("Failed to load session details");
       currentSessionData = await res.json();
       replaySessionSelect.value = sessionId;
+      if ([...playgroundEvaluationSession.options].some(option => option.value === sessionId)) {
+        playgroundEvaluationSession.value = sessionId;
+        fetchSessionEvaluationHistory(sessionId);
+      }
       sessionContext.textContent = `Session: ${sessionId}`;
       sessionContext.disabled = false;
 

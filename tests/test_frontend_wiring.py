@@ -33,3 +33,18 @@ def test_mobile_navigation_has_an_accessible_header_toggle():
     assert "#session-count-badge { display: none; }" in css
     assert 'mobileNavToggle.addEventListener("click", toggleMobileNavigation)' in source
     assert 'mobileNavToggle.setAttribute("aria-expanded", "false")' in source
+
+
+def test_experiment_and_playground_have_recorded_output_evaluation_controls():
+    html = APP_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="experiment-evaluation-criteria"' in html
+    assert 'id="evaluate-experiment-btn"' in html
+    assert 'id="experiment-evaluation-history"' in html
+    assert 'id="playground-evaluation-session"' in html
+    assert 'id="evaluate-recorded-session-btn"' in html
+    assert 'id="playground-evaluation-history"' in html
+    assert "/api/experiments/${encodeURIComponent(currentExperimentId)}/evaluations" in source
+    assert "/api/evaluations/sessions/${encodeURIComponent(sessionId)}" in source
+    assert "output_source" in source

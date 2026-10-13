@@ -134,7 +134,15 @@ def test_api_playground_missing_key_is_explicit_and_recorded(client, monkeypatch
     assert res.status_code == 503
     assert "not configured" in res.json()["detail"]
     sessions = client.get("/api/sessions").json()
-    assert any(item["session_id"].startswith("playground_") for item in sessions)
+    playground_session = next(
+        item["session_id"] for item in sessions if item["session_id"].startswith("playground_")
+    )
+    evaluation = client.post(
+        f"/api/evaluations/sessions/{playground_session}",
+        json={"criteria": {"expected_output": {"text": "must not pass"}}},
+    )
+    assert evaluation.status_code == 200
+    assert evaluation.json()["result"]["status"] == "failed"
 
 
 def test_api_usage_groups_model_events(client):
@@ -198,6 +206,7 @@ def test_api_playground_records_provider_success(monkeypatch):
 
     assert res.status_code == 200
     assert res.json()["text"] == "hello back"
+    assert res.json()["output_source"] == "real_provider_call"
     events = storage.get_events(res.json()["session_id"])
     assert events[0].provider == "openai"
     assert events[0].tokens_total == 8

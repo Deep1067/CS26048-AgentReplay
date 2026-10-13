@@ -113,6 +113,21 @@ class SQLiteStorage:
                         result_json TEXT NOT NULL
                     );
                 """)
+                self._conn.execute("""
+                    CREATE TABLE IF NOT EXISTS evaluations (
+                        evaluation_id TEXT PRIMARY KEY,
+                        evaluated_at TEXT NOT NULL,
+                        target_type TEXT NOT NULL,
+                        session_id TEXT,
+                        experiment_id TEXT,
+                        criteria_json TEXT NOT NULL,
+                        result_json TEXT NOT NULL
+                    );
+                """)
+                self._conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_evaluations_target
+                    ON evaluations (session_id, experiment_id, evaluated_at);
+                """)
 
     def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> str:
         now = datetime.now(UTC).isoformat()
@@ -401,3 +416,86 @@ class SQLiteStorage:
             }
             for row in rows
         ]
+
+    def create_evaluation(
+        self,
+        evaluation_id: str,
+        target_type: str,
+        session_id: str | None,
+        experiment_id: str | None,
+        criteria: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        evaluated_at = result["evaluated_at"]
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO evaluations (
+                        evaluation_id, evaluated_at, target_type, session_id, experiment_id,
+                        criteria_json, result_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        evaluation_id,
+                        evaluated_at,
+                        target_type,
+                        session_id,
+                        experiment_id,
+                        json.dumps(criteria),
+                        json.dumps(result),
+                    ),
+                )
+        return {
+            "evaluation_id": evaluation_id,
+            "evaluated_at": evaluated_at,
+            "target_type": target_type,
+            "session_id": session_id,
+            "experiment_id": experiment_id,
+            "criteria": criteria,
+            "result": result,
+        }
+
+    def list_evaluations(
+        self,
+        session_id: str | None = None,
+        experiment_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions = []
+        parameters: list[str] = []
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            parameters.append(session_id)
+        if experiment_id is not None:
+            conditions.append("experiment_id = ?")
+            parameters.append(experiment_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT evaluation_id, evaluated_at, target_type, session_id, experiment_id,
+                    criteria_json, result_json
+                FROM evaluations {where}
+                ORDER BY evaluated_at DESC, evaluation_id DESC;
+                """,
+                parameters,
+            ).fetchall()
+        evaluations = []
+        for row in rows:
+            try:
+                criteria = json.loads(row["criteria_json"])
+                result = json.loads(row["result_json"])
+            except (TypeError, ValueError):
+                continue
+            evaluations.append(
+                {
+                    "evaluation_id": row["evaluation_id"],
+                    "evaluated_at": row["evaluated_at"],
+                    "target_type": row["target_type"],
+                    "session_id": row["session_id"],
+                    "experiment_id": row["experiment_id"],
+                    "criteria": criteria,
+                    "result": result,
+                }
+            )
+        return evaluations

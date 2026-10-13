@@ -146,6 +146,22 @@
           <p class="text-muted">Provider calls happen only when you submit. API keys remain server-side and are never recorded.</p>
           <div id="provider-notice" class="notice-panel">Loading provider configuration...</div>
           <div id="playground-messages" class="playground-messages"></div>
+          <div class="evaluation-controls">
+            <label class="control-group">
+              <span class="metric-label">Recorded session to evaluate</span>
+              <select id="playground-evaluation-session" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Deterministic criteria (JSON)</span>
+              <textarea id="playground-evaluation-criteria" class="prompt-input" rows="3">{"required_fields":["text"]}</textarea>
+            </label>
+            <button id="evaluate-recorded-session-btn" class="btn btn-secondary" type="button">Evaluate recorded output</button>
+            <div id="playground-evaluation-results" class="replay-results" aria-live="polite">
+              <p class="text-muted">Evaluation uses recorded output only; it does not call a provider.</p>
+            </div>
+            <h3 class="section-heading">Session evaluation history</h3>
+            <div id="playground-evaluation-history" class="experiment-history"><p class="text-muted">Select a session to view saved evaluations.</p></div>
+          </div>
           <form id="playground-form" class="playground-form">
             <select id="playground-provider" class="select-input" aria-label="Provider"></select>
             <input id="playground-model" class="text-input" placeholder="Model (optional)">
@@ -200,6 +216,18 @@
               <textarea id="experiment-result-input" class="prompt-input" rows="4">{"status":"ok","balance":500.0}</textarea>
             </label>
             <button id="run-experiment-btn" class="btn btn-primary">Run comparison</button>
+          </div>
+          <div class="evaluation-controls">
+            <label class="control-group">
+              <span class="metric-label">Evaluation criteria for both runs (JSON)</span>
+              <textarea id="experiment-evaluation-criteria" class="prompt-input" rows="4">{"expected_output":{"credit_limit":1250.0},"required_fields":["credit_limit"]}</textarea>
+            </label>
+            <button id="evaluate-experiment-btn" class="btn btn-secondary" type="button" disabled>Evaluate baseline and fork</button>
+            <div id="experiment-evaluation-results" class="replay-results" aria-live="polite">
+              <p class="text-muted">Run or open a saved comparison before evaluating it.</p>
+            </div>
+            <h3 class="section-heading">Evaluation history</h3>
+            <div id="experiment-evaluation-history" class="experiment-history"><p class="text-muted">No evaluation selected.</p></div>
           </div>
           <div id="experiment-results" class="replay-results">
             <p class="text-muted">Select an eligible session above. Experiment runs are saved and can be reopened here.</p>

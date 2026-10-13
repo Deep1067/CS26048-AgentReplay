@@ -12,6 +12,7 @@
 | M7 | Replay API, four-tab UI, editable pricing, cost history, and detector settings |
 | M8 | Security hardening, DOM-safe rendering, CORS restriction, testing, and documentation |
 | Phase 1 foundation | Persisted guided comparisons from supported recorded sessions, explicit usage/cost availability, connected section navigation, and live-monitor capability reporting |
+| Phase 2 | Deterministic configurable evaluation of recorded session outputs and persisted baseline/fork comparisons, with evidence, versioning, and append-only history |
 
 ## Current status
 
@@ -29,5 +30,22 @@ The local implementation is functional and validated by the automated test suite
 - The Live Monitor refreshes the configured session store periodically. It does not report agent
   running state or stream events. Server-defined scenario execution remains disabled unless
   `LIVE_RUN_ENABLED` is enabled.
-- Generalized experiment execution for arbitrary agent graphs, live event streaming, configured
-  quality evaluators, and provider-confirmed billing remain later-phase work.
+- Generalized experiment execution for arbitrary agent graphs, live event streaming, and
+  provider-confirmed billing remain later-phase work.
+
+## Phase 2 deterministic evaluation
+
+- The evaluator applies validated JSON expected-value checks, dotted-path required fields,
+  case-insensitive required phrases, recorded error detection/acceptance, and optional latency,
+  token, and estimated-cost thresholds. It does not execute user code or call an LLM judge.
+- Evaluations are appended to SQLite history with criteria, evaluator version, timestamp, session
+  or experiment identifiers, result explanations, and event evidence references.
+- Experiment evaluations run the same criteria against the persisted baseline and fork and show
+  per-criterion status comparisons; no weighted aggregate hides failed checks.
+- The Playground can evaluate a selected recorded session offline. Actual Playground completions
+  continue to come only from configured server-side providers and are labeled as provider output.
+- Strict replay validity is separate from task/output quality. Session evaluation does not execute
+  replay; saved experiment evaluation reports the strict replay evidence already recorded there.
+- Future work includes reusable named criteria sets, richer structured assertions, persisted
+  replay-divergence runs, and calibrated quality evaluators. Efficiency remains descriptive and
+  estimated cost is not provider-confirmed billing.

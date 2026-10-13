@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from agent_replay.config import CONFIG_MUTATIONS_ENABLED, LIVE_RUN_ENABLED, USD_TO_INR
 from agent_replay.detector.config import DetectorConfig
 from agent_replay.detector.engine import DetectorEngine
+from agent_replay.evaluation import compare_evaluations, evaluate_session, validate_criteria
 from agent_replay.models import Event
 from agent_replay.pricing import get_price_engine
 from agent_replay.providers import call_provider, configured_providers
@@ -190,6 +191,20 @@ class ExperimentRequest(BaseModel):
     baseline_session_id: str
     substitute_seq: int
     substitute_result: Any
+
+
+class EvaluationRequest(BaseModel):
+    criteria: dict[str, Any]
+    replay_calls: list[ReplayCallRequest] | None = None
+
+
+def _experiment_snapshot_events(session_id: str, raw_events: list[dict[str, Any]]) -> list[Event]:
+    events = []
+    for raw_event in raw_events:
+        event_data = dict(raw_event)
+        event_data["session_id"] = session_id
+        events.append(Event(**event_data))
+    return events
 
 
 def _decode_json(value: str | None) -> Any:
@@ -422,6 +437,7 @@ def create_app(
                 "provider": response.provider,
                 "model": response.model,
                 "text": response.text,
+                "output_source": "real_provider_call",
                 "usage": response.usage,
                 "cost_usd": cost,
                 "cost_status": "estimated" if cost is not None else "unavailable",
@@ -683,6 +699,132 @@ def create_app(
             "halted": any(event["status"] == "diverged" for event in results),
         }
 
+    @app.get("/api/evaluations")
+    def list_evaluations(
+        session_id: str | None = Query(default=None, min_length=1),
+        experiment_id: str | None = Query(default=None, min_length=1),
+    ) -> dict[str, Any]:
+        return {
+            "evaluations": actual_storage.list_evaluations(
+                session_id=session_id,
+                experiment_id=experiment_id,
+            )
+        }
+
+    @app.post("/api/evaluations/sessions/{session_id}")
+    def evaluate_recorded_session(session_id: str, request: EvaluationRequest) -> dict[str, Any]:
+        if not actual_storage.get_session(session_id):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        try:
+            criteria = validate_criteria(request.criteria)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        events = actual_storage.get_events(session_id)
+        result = evaluate_session(session_id, events, criteria)
+        if request.replay_calls is not None:
+            replay_checks = []
+            for index, call in enumerate(request.replay_calls):
+                if index >= len(events):
+                    replay_checks.append(
+                        {
+                            "status": "diverged",
+                            "seq": index + 1,
+                            "expected": None,
+                            "requested": call.model_dump(),
+                        }
+                    )
+                    break
+                event = events[index]
+                expected = {
+                    "type": event.type,
+                    "name": event.name,
+                    "args": _decode_json(event.args_json),
+                }
+                requested = call.model_dump()
+                if (
+                    expected["type"] != call.type
+                    or expected["name"] != call.name
+                    or expected["args"] != call.args
+                ):
+                    replay_checks.append(
+                        {
+                            "status": "diverged",
+                            "seq": event.seq,
+                            "expected": expected,
+                            "requested": requested,
+                        }
+                    )
+                    break
+                replay_checks.append(
+                    {
+                        "status": "matched",
+                        "seq": event.seq,
+                        "expected": expected,
+                        "requested": requested,
+                    }
+                )
+            if not any(item["status"] == "diverged" for item in replay_checks):
+                if not events:
+                    replay_status = "unavailable"
+                elif len(request.replay_calls) < len(events):
+                    replay_status = "incomplete"
+                    replay_checks.append(
+                        {
+                            "status": "not_checked",
+                            "seq": events[len(request.replay_calls)].seq,
+                            "reason": "The replay call sequence ended before the trace did.",
+                        }
+                    )
+                else:
+                    replay_status = "passed"
+            else:
+                replay_status = "diverged"
+            replay_explanations = {
+                "passed": "Every supplied replay call matched the recorded trace.",
+                "incomplete": "Replay call sequence ended before all recorded events were checked.",
+                "diverged": "Replay call sequence diverged from the recorded trace.",
+                "unavailable": "The session has no events to validate.",
+            }
+            result["replay_validity"] = {
+                "status": replay_status,
+                "explanation": replay_explanations[replay_status],
+                "evidence": replay_checks,
+            }
+            replay_evaluator_status = {
+                "passed": "passed",
+                "incomplete": "partial",
+                "diverged": "failed",
+                "unavailable": "unavailable",
+            }[replay_status]
+            result["evaluators"]["replay_divergence"] = {
+                "name": "Strict replay divergence",
+                "version": result["evaluator_version"],
+                "status": replay_evaluator_status,
+                "explanation": result["replay_validity"]["explanation"],
+                "evidence": replay_checks,
+                "limitations": [],
+            }
+            if replay_evaluator_status == "failed":
+                result["status"] = "failed"
+                result["status_explanation"] = (
+                    "Strict replay diverged from the recorded trace; inspect the mismatched call."
+                )
+            elif replay_evaluator_status == "partial" and result["status"] == "passed":
+                result["status"] = "partial"
+                result["status_explanation"] = (
+                    "Replay validation was incomplete because not all recorded calls were supplied."
+                )
+        evaluation_id = f"evaluation_{uuid.uuid4().hex[:12]}"
+        record = actual_storage.create_evaluation(
+            evaluation_id=evaluation_id,
+            target_type="session",
+            session_id=session_id,
+            experiment_id=None,
+            criteria=criteria,
+            result=result,
+        )
+        return record
+
     @app.get("/api/experiments/baselines")
     def get_experiment_baselines() -> dict[str, Any]:
         return {"baselines": list_supported_baselines(actual_storage)}
@@ -697,6 +839,79 @@ def create_app(
         if not experiment:
             raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
         return experiment
+
+    @app.get("/api/experiments/{experiment_id}/evaluations")
+    def list_experiment_evaluations(experiment_id: str) -> dict[str, Any]:
+        if not actual_storage.get_experiment(experiment_id):
+            raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
+        return {"evaluations": actual_storage.list_evaluations(experiment_id=experiment_id)}
+
+    @app.post("/api/experiments/{experiment_id}/evaluations")
+    def evaluate_experiment(experiment_id: str, request: EvaluationRequest) -> dict[str, Any]:
+        experiment = actual_storage.get_experiment(experiment_id)
+        if not experiment:
+            raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
+        try:
+            criteria = validate_criteria(request.criteria)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        experiment_result = experiment["result"]
+        baseline_id = experiment["baseline_session_id"]
+        fork_id = experiment["fork_session_id"]
+        baseline_events = actual_storage.get_events(baseline_id)
+        fork_events = actual_storage.get_events(fork_id)
+        limitations = []
+        if not baseline_events:
+            baseline_snapshot = experiment_result.get("events", {}).get("baseline", [])
+            baseline_events = _experiment_snapshot_events(baseline_id, baseline_snapshot)
+            limitations.append(
+                "Baseline session events were read from the saved experiment snapshot."
+            )
+        if not fork_events:
+            fork_snapshot = experiment_result.get("events", {}).get("forked", [])
+            fork_events = _experiment_snapshot_events(fork_id, fork_snapshot)
+            limitations.append("Fork session events were read from the saved experiment snapshot.")
+
+        baseline = evaluate_session(baseline_id, baseline_events, criteria)
+        fork = evaluate_session(fork_id, fork_events, criteria)
+        result = {
+            "experiment_id": experiment_id,
+            "evaluator_version": baseline["evaluator_version"],
+            "evaluated_at": datetime.now(UTC).isoformat(),
+            "status": (
+                "failed"
+                if "failed" in {baseline["status"], fork["status"]}
+                else "partial"
+                if "partial" in {baseline["status"], fork["status"]}
+                else "passed"
+                if baseline["status"] == fork["status"] == "passed"
+                else "unavailable"
+            ),
+            "baseline_session_id": baseline_id,
+            "fork_session_id": fork_id,
+            "replay_validity": {
+                "status": "passed",
+                "explanation": (
+                    "The saved guided experiment completed strict replay before the fork. "
+                    "This is replay validity, not a task-quality score."
+                ),
+                "evidence": experiment_result.get("evidence", {}).get("strict_replay"),
+            },
+            "baseline": baseline,
+            "fork": fork,
+            "comparison": compare_evaluations(baseline, fork),
+            "limitations": limitations,
+        }
+        evaluation_id = f"evaluation_{uuid.uuid4().hex[:12]}"
+        return actual_storage.create_evaluation(
+            evaluation_id=evaluation_id,
+            target_type="experiment",
+            session_id=None,
+            experiment_id=experiment_id,
+            criteria=criteria,
+            result=result,
+        )
 
     @app.post("/api/experiments")
     def create_guided_experiment(request: ExperimentRequest) -> dict[str, Any]:

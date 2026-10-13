@@ -152,6 +152,43 @@ Guided experiment endpoints are `GET /api/experiments/baselines`, `POST /api/exp
 `GET /api/experiments`, and `GET /api/experiments/{experiment_id}`. The older
 `POST /api/experiments/counterfactual` endpoint remains available for compatibility.
 
+### Deterministic evaluation
+
+Recorded session outputs and saved guided comparisons can be evaluated offline. The evaluator
+reads the final recorded event result and supports JSON expected values, required dotted-path
+fields, required phrases, recorded error acceptance, and optional maxima for summed event
+duration, recorded tokens, and estimated cost. Criteria are validated by the server; arbitrary
+user code and paid model judges are not executed.
+
+```json
+{
+  "expected_output": {"credit_limit": 1250.0},
+  "required_fields": ["credit_limit"],
+  "required_phrases": [],
+  "allow_tool_errors": false,
+  "max_latency_ms": 5000,
+  "max_tokens": 2000,
+  "max_cost_usd": 0.02
+}
+```
+
+Use `POST /api/evaluations/sessions/{session_id}` to evaluate a recorded session or
+`POST /api/experiments/{experiment_id}/evaluations` to evaluate the persisted baseline and fork
+with identical criteria. `GET /api/evaluations?session_id=...` and
+`GET /api/experiments/{experiment_id}/evaluations` return append-only evaluation history.
+Evaluator outputs include status explanations and event references. Expected-value checks inspect
+the final recorded result (nested object criteria are subset matches); required fields use dotted
+paths and required phrases are case-insensitive string matches. Missing evidence is reported as
+unavailable, not as a pass.
+Session evaluation may include an optional `replay_calls` array (each call has `type`, `name`, and
+`args`) to persist strict-match, divergence, or incomplete-sequence evidence against the trace.
+
+Replay validity remains separate from output quality. Session evaluations do not run strict replay;
+saved experiment evaluations report the replay result recorded by the guided experiment. Efficiency
+measurements do not score answer quality: summed event durations are not wall-clock benchmarks,
+and configured-rate costs are estimates, not provider-confirmed billing. No weighted aggregate
+score is calculated.
+
 ---
 
 ## 🌐 Interactive Timeline Web UI
@@ -171,12 +208,16 @@ Open your browser to: **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
 - **Guided Experiments**: Compare eligible recorded account-workflow baselines with persisted,
   deterministic forks. Strict replay, substituted output, and downstream fork execution are
   labeled separately. Other recorded agent workflows are not currently eligible.
+- **Deterministic Evaluation**: Configure expected JSON values, required output fields/phrases,
+  error acceptance, and optional resource thresholds; inspect evidence-backed session and
+  baseline/fork results offline with append-only history.
 - **Model Usage & Costs**: Filter recorded model usage by provider, model, and execution session.
   Per-session records avoid conflating a baseline with its fork. Configured-rate values are
   estimates, not provider-confirmed bills; missing usage or pricing remains unavailable.
 - **AI Playground**: Exercise configured OpenAI, Anthropic, or Gemini adapters from the server,
   with each submitted run recorded as its own session and failed provider calls recorded as failed
-  events. Provider keys stay server-side.
+  events. Provider keys stay server-side. Recorded session outputs can also be evaluated without
+  making a provider call.
 - **Live Monitor / Run**: Refresh the configured server's recorded-session list periodically.
   This is not a stream of per-event state and does not imply that an agent is currently running.
   Scenario execution remains disabled unless `LIVE_RUN_ENABLED` is explicitly enabled.
