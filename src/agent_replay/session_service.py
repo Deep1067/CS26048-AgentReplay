@@ -13,6 +13,31 @@ def event_status(event: Any) -> str:
     return "success"
 
 
+def cost_summary(events: list[Any]) -> tuple[float | None, str]:
+    """Aggregate model-call costs only when every relevant cost is available."""
+    model_events = [event for event in events if event.type == "model_call"]
+    if not model_events or any(event.cost_status == "unavailable" for event in model_events):
+        return None, "unavailable"
+    status = (
+        "estimated" if any(event.cost_status == "estimated" for event in model_events) else "actual"
+    )
+    return round(sum(event.cost_usd for event in model_events), 8), status
+
+
+def token_usage_summary(events: list[Any]) -> tuple[int | None, int | None, bool]:
+    model_events = [event for event in events if event.type == "model_call"]
+    if not model_events or any(
+        event.tokens_total is None and not event.tokens_in and not event.tokens_out
+        for event in model_events
+    ):
+        return None, None, False
+    return (
+        sum(event.tokens_in for event in model_events),
+        sum(event.tokens_out for event in model_events),
+        True,
+    )
+
+
 class SessionService:
     """Service for computing per-session totals and aggregated metrics."""
 
@@ -30,9 +55,9 @@ class SessionService:
             return None
 
         events = self.storage.get_events(session_id)
-        total_tokens_in = sum(e.tokens_in for e in events)
-        total_tokens_out = sum(e.tokens_out for e in events)
-        total_cost_usd = sum(e.cost_usd for e in events)
+        model_events = [event for event in events if event.type == "model_call"]
+        total_tokens_in, total_tokens_out, usage_available = token_usage_summary(events)
+        total_cost_usd, cost_status = cost_summary(events)
         total_duration_ms = sum(e.duration_ms for e in events)
 
         tool_calls_count = sum(1 for e in events if e.type == "tool_call")
@@ -70,7 +95,8 @@ class SessionService:
             "model_calls_count": model_calls_count,
             "total_tokens_in": total_tokens_in,
             "total_tokens_out": total_tokens_out,
-            "total_cost_usd": round(total_cost_usd, 6),
+            "total_cost_usd": total_cost_usd,
+            "cost_status": cost_status,
             "total_duration_ms": round(total_duration_ms, 2),
             "has_errors": summary.has_errors,
             "successful_events": successful_events,
@@ -82,12 +108,29 @@ class SessionService:
             ),
             "tool_stats": tool_stats,
             "metrics_available": {
-                "tokens": any(
-                    event.type == "model_call" and (event.tokens_in > 0 or event.tokens_out > 0)
-                    for event in events
-                ),
-                "cost": any(event.cost_usd != 0 for event in events),
+                "tokens": usage_available,
+                "cost": total_cost_usd is not None,
             },
+            "model_usage": [
+                {
+                    "seq": event.seq,
+                    "provider": event.provider or "unknown",
+                    "model": event.model or event.name,
+                    "tokens_in": (
+                        event.tokens_in
+                        if event.tokens_in or event.tokens_out or event.tokens_total is not None
+                        else None
+                    ),
+                    "tokens_out": (
+                        event.tokens_out
+                        if event.tokens_in or event.tokens_out or event.tokens_total is not None
+                        else None
+                    ),
+                    "cost_usd": (event.cost_usd if event.cost_status != "unavailable" else None),
+                    "cost_status": event.cost_status,
+                }
+                for event in model_events
+            ],
             "flags": [f.to_dict() for f in flags],
             "events": enriched_events,
         }

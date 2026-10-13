@@ -1,4 +1,5 @@
 import json
+import math
 import uuid
 from typing import Any
 
@@ -7,6 +8,8 @@ from agent_replay.recorder import record_session
 from agent_replay.replay.engine import replay_session
 from agent_replay.storage import SQLiteStorage
 from scenarios.scenario_2_malformed_response import agent_workflow
+
+DEFAULT_SUBSTITUTE_RESULT = {"status": "ok", "balance": 500.0}
 
 
 def _outcome(value: Any) -> Any:
@@ -19,6 +22,78 @@ def _outcome(value: Any) -> Any:
 
 def _event_payload(event: Any) -> dict[str, Any]:
     return event.to_dict()
+
+
+def _decode_json(value: str | None) -> Any:
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _is_supported_baseline(events: list[Any]) -> bool:
+    if not events or events[0].seq != 1:
+        return False
+    first = events[0]
+    if first.type != "tool_call" or first.name != "query_user_account":
+        return False
+    if _decode_json(first.args_json) != {"args": [], "kwargs": {"user_id": 101}}:
+        return False
+    return all(
+        event.seq == index
+        and event.type == "tool_call"
+        and event.name in {"query_user_account", "calculate_credit"}
+        for index, event in enumerate(events, start=1)
+    )
+
+
+def list_supported_baselines(storage: SQLiteStorage) -> list[dict[str, Any]]:
+    baselines = []
+    for summary in storage.list_sessions():
+        events = storage.get_events(summary.session_id)
+        if not _is_supported_baseline(events):
+            continue
+        baselines.append(
+            {
+                "session_id": summary.session_id,
+                "started_at": summary.started_at,
+                "event_count": len(events),
+                "substitutable_events": [
+                    {
+                        "seq": events[0].seq,
+                        "type": events[0].type,
+                        "name": events[0].name,
+                        "args": _decode_json(events[0].args_json),
+                        "recorded_result": _decode_json(events[0].result_json),
+                        "error": events[0].error,
+                    }
+                ],
+            }
+        )
+    return baselines
+
+
+def validate_substitute_result(result: Any) -> None:
+    if not isinstance(result, dict):
+        raise ValueError("The substituted tool response must be a JSON object.")
+    status = result.get("status")
+    if status == "error":
+        if "message" in result and not isinstance(result["message"], str):
+            raise ValueError("An error response message must be a string.")
+        return
+    balance = result.get("balance")
+    if (
+        status != "ok"
+        or isinstance(balance, bool)
+        or not isinstance(balance, (int, float))
+        or not math.isfinite(balance)
+    ):
+        raise ValueError(
+            'Use a supported response: {"status":"ok","balance": number} '
+            'or {"status":"error","message":"reason"}.'
+        )
 
 
 def _event_diff(baseline: list[Any], forked: list[Any]) -> dict[str, list[dict[str, Any]]]:
@@ -74,13 +149,13 @@ def _metrics(baseline: list[Any], forked: list[Any]) -> dict[str, Any]:
             or any(event.tokens_in or event.tokens_out for event in forked_models)
         )
     )
-    cost_available = bool(
-        baseline_models
-        and forked_models
-        and (
-            any(event.cost_usd for event in baseline_models)
-            or any(event.cost_usd for event in forked_models)
-        )
+    cost_available = bool(baseline_models or forked_models) and all(
+        event.cost_status != "unavailable" for event in baseline_models + forked_models
+    )
+    cost_status = (
+        "estimated"
+        if any(event.cost_status == "estimated" for event in baseline_models + forked_models)
+        else "actual"
     )
     return {
         "event_count_delta": len(forked) - len(baseline),
@@ -89,7 +164,10 @@ def _metrics(baseline: list[Any], forked: list[Any]) -> dict[str, Any]:
             "forked": round(forked_duration, 2),
             "delta": round(forked_duration - baseline_duration, 2),
             "available": True,
-            "label": "recorded local wall-clock durations; synthetic scenario timing",
+            "label": (
+                "recorded per-event durations; substitution is zero-duration and values are "
+                "not a benchmark"
+            ),
         },
         "tokens": {
             "available": usage_available,
@@ -108,6 +186,7 @@ def _metrics(baseline: list[Any], forked: list[Any]) -> dict[str, Any]:
         },
         "cost_usd_estimate": {
             "available": cost_available,
+            "status": cost_status if cost_available else "unavailable",
             "baseline": round(sum(event.cost_usd for event in baseline_models), 8)
             if cost_available
             else None,
@@ -126,22 +205,46 @@ def _metrics(baseline: list[Any], forked: list[Any]) -> dict[str, Any]:
     }
 
 
-def run_counterfactual_experiment(storage: SQLiteStorage) -> dict[str, Any]:
+def run_counterfactual_experiment(
+    storage: SQLiteStorage,
+    baseline_session_id: str | None = None,
+    substitute_seq: int = 1,
+    substitute_result: Any = None,
+) -> dict[str, Any]:
     experiment_id = f"experiment_{uuid.uuid4().hex[:12]}"
-    baseline_session_id = f"{experiment_id}_baseline"
+    created_baseline = baseline_session_id is None
+    if created_baseline:
+        baseline_session_id = f"{experiment_id}_baseline"
     forked_session_id = f"{experiment_id}_fork"
-    substitute_seq = 1
-    substitute_result = {"status": "ok", "balance": 500.0}
+    if substitute_result is None:
+        substitute_result = DEFAULT_SUBSTITUTE_RESULT
+    if substitute_seq != 1:
+        raise ValueError(
+            "This guided workflow supports substituting event #1 (query_user_account) only."
+        )
+    validate_substitute_result(substitute_result)
 
-    with record_session(
-        baseline_session_id,
-        storage=storage,
-        metadata={"experiment_id": experiment_id, "role": "baseline"},
-    ):
-        baseline_outcome = agent_workflow()
+    if created_baseline:
+        with record_session(
+            baseline_session_id,
+            storage=storage,
+            metadata={"experiment_id": experiment_id, "role": "baseline"},
+        ):
+            baseline_outcome = agent_workflow()
+    else:
+        baseline_events = storage.get_events(baseline_session_id)
+        if not _is_supported_baseline(baseline_events):
+            raise ValueError(
+                "This session is not eligible. Guided experiments currently support "
+                "the recorded scenario-2 account workflow."
+            )
+        if not any(event.seq == substitute_seq for event in baseline_events):
+            raise ValueError("The selected substitution event is not in the baseline session.")
 
     with replay_session(baseline_session_id, storage=storage, mode="strict"):
         strict_outcome = agent_workflow()
+    if not created_baseline:
+        baseline_outcome = strict_outcome
 
     with replay_session(
         baseline_session_id,
@@ -168,9 +271,20 @@ def run_counterfactual_experiment(storage: SQLiteStorage) -> dict[str, Any]:
         },
     )
 
-    return {
+    result = {
         "experiment_id": experiment_id,
         "mode": "forked_runtime_execution",
+        "evidence": {
+            "baseline": (
+                "recorded workflow run"
+                if created_baseline
+                else "workflow reconstructed by strict replay"
+            ),
+            "strict_replay": (
+                "reconstructed from recorded tool responses; no downstream tools executed"
+            ),
+            "forked": "supported workflow executed after the selected tool-response substitution",
+        },
         "trace_validation_note": (
             "POST /api/replay validates a trace; this result ran the supported workflow."
         ),
@@ -197,3 +311,10 @@ def run_counterfactual_experiment(storage: SQLiteStorage) -> dict[str, Any]:
         },
         "fork_metadata": storage.get_session_metadata(forked_session_id),
     }
+    storage.create_experiment(
+        experiment_id=experiment_id,
+        baseline_session_id=baseline_session_id,
+        fork_session_id=forked_session_id,
+        result=result,
+    )
+    return result

@@ -21,8 +21,16 @@ from agent_replay.pricing import get_price_engine
 from agent_replay.providers import call_provider, configured_providers
 from agent_replay.replay.engine import ReplayEngine
 from agent_replay.replay.exceptions import ReplayDivergenceError
-from agent_replay.replay.experiment import run_counterfactual_experiment
-from agent_replay.session_service import SessionService, event_status
+from agent_replay.replay.experiment import (
+    list_supported_baselines,
+    run_counterfactual_experiment,
+)
+from agent_replay.session_service import (
+    SessionService,
+    cost_summary,
+    event_status,
+    token_usage_summary,
+)
 from agent_replay.storage import SQLiteStorage
 
 logger = logging.getLogger(__name__)
@@ -178,6 +186,12 @@ class PlaygroundRequest(BaseModel):
     model: str | None = None
 
 
+class ExperimentRequest(BaseModel):
+    baseline_session_id: str
+    substitute_seq: int
+    substitute_result: Any
+
+
 def _decode_json(value: str | None) -> Any:
     if value is None:
         return None
@@ -250,19 +264,22 @@ def create_app(
     def list_sessions() -> list[dict[str, Any]]:
         """List all recorded sessions with summary metrics."""
         summaries = actual_storage.list_sessions()
-        return [s.to_dict() for s in summaries]
+        items = []
+        for summary in summaries:
+            item = summary.to_dict()
+            item["total_cost_usd"], item["cost_status"] = cost_summary(
+                actual_storage.get_events(summary.session_id)
+            )
+            items.append(item)
+        return items
 
     @app.get("/api/overview")
     def get_overview() -> dict[str, Any]:
         summaries = actual_storage.list_sessions()
         total_events = sum(item.event_count for item in summaries)
         details = [session_service.get_session_details(item.session_id) for item in summaries]
-        model_events = [
-            event
-            for item in details
-            if item
-            for event in item["events"]
-            if event["type"] == "model_call"
+        all_events = [
+            event for item in summaries for event in actual_storage.get_events(item.session_id)
         ]
         return {
             "session_count": len(summaries),
@@ -270,10 +287,15 @@ def create_app(
             "successful_events": sum(item["successful_events"] for item in details if item),
             "failed_events": sum(item["failed_events"] for item in details if item),
             "total_duration_ms": round(sum(item.total_duration_ms for item in summaries), 2),
-            "model_usage_available": any(
-                event["tokens_in"] or event["tokens_out"] for event in model_events
-            ),
-            "recent_sessions": [item.to_dict() for item in summaries[:5]],
+            "model_usage_available": token_usage_summary(all_events)[2],
+            "recent_sessions": [
+                {
+                    **item.to_dict(),
+                    "total_cost_usd": cost_summary(actual_storage.get_events(item.session_id))[0],
+                    "cost_status": cost_summary(actual_storage.get_events(item.session_id))[1],
+                }
+                for item in summaries[:5]
+            ],
         }
 
     @app.get("/api/providers")
@@ -286,7 +308,8 @@ def create_app(
         model: str | None = Query(default=None, min_length=1),
         session_id: str | None = Query(default=None, min_length=1),
     ) -> dict[str, Any]:
-        grouped: dict[str, dict[str, Any]] = {}
+        grouped_events: dict[str, list[Event]] = {}
+        records: list[dict[str, Any]] = []
         sessions: list[dict[str, Any]] = []
         for summary in actual_storage.list_sessions():
             if session_id and summary.session_id != session_id:
@@ -301,45 +324,60 @@ def create_app(
             ]
             if not model_events:
                 continue
+            by_model: dict[str, list[Event]] = {}
             for event in model_events:
                 key = f"{event.provider or 'unknown'}:{event.model or event.name}"
-                item = grouped.setdefault(
-                    key,
+                grouped_events.setdefault(key, []).append(event)
+                by_model.setdefault(key, []).append(event)
+            for key, events in by_model.items():
+                model_cost, model_cost_status = cost_summary(events)
+                input_tokens, output_tokens, usage_available = token_usage_summary(events)
+                records.append(
                     {
-                        "provider": event.provider or "unknown",
-                        "model": event.model or event.name,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cost_usd": None,
-                        "cost_status": "unavailable",
-                        "sessions": 0,
-                    },
+                        "session_id": summary.session_id,
+                        "provider": events[0].provider or "unknown",
+                        "model": events[0].model or events[0].name,
+                        "event_count": len(events),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "usage_available": usage_available,
+                        "cost_usd": model_cost,
+                        "cost_status": model_cost_status,
+                    }
                 )
-                item["input_tokens"] += event.tokens_in
-                item["output_tokens"] += event.tokens_out
-                if event.cost_status != "unavailable":
-                    item["cost_usd"] = (item["cost_usd"] or 0.0) + event.cost_usd
-                    item["cost_status"] = event.cost_status
-                item["sessions"] = item["sessions"] + 1
-            available_cost = [
-                event.cost_usd for event in model_events if event.cost_status != "unavailable"
-            ]
+            session_cost, session_cost_status = cost_summary(model_events)
+            input_tokens, output_tokens, usage_available = token_usage_summary(model_events)
             sessions.append(
                 {
                     "session_id": summary.session_id,
-                    "models": len(model_events),
-                    "input_tokens": sum(event.tokens_in for event in model_events),
-                    "output_tokens": sum(event.tokens_out for event in model_events),
-                    "cost_usd": round(sum(available_cost), 8) if available_cost else None,
-                    "cost_available": any(
-                        event.cost_status != "unavailable" for event in model_events
+                    "models": len(
+                        {(event.provider, event.model or event.name) for event in model_events}
                     ),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "usage_available": usage_available,
+                    "cost_usd": session_cost,
+                    "cost_status": session_cost_status,
+                    "cost_available": session_cost is not None,
                 }
             )
-        for item in grouped.values():
-            if item["cost_usd"] is not None:
-                item["cost_usd"] = round(item["cost_usd"], 8)
-        return {"groups": list(grouped.values()), "sessions": sessions}
+        groups = []
+        for key, events in grouped_events.items():
+            model_cost, model_cost_status = cost_summary(events)
+            input_tokens, output_tokens, usage_available = token_usage_summary(events)
+            groups.append(
+                {
+                    "provider": events[0].provider or "unknown",
+                    "model": events[0].model or events[0].name,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "usage_available": usage_available,
+                    "cost_usd": model_cost,
+                    "cost_status": model_cost_status,
+                    "sessions": len({event.session_id for event in events}),
+                }
+            )
+        return {"groups": groups, "sessions": sessions, "records": records}
 
     @app.post("/api/playground/chat")
     def playground_chat(request: PlaygroundRequest) -> dict[str, Any]:
@@ -506,14 +544,17 @@ def create_app(
     @app.get("/api/cost-over-time")
     def get_cost_over_time() -> dict[str, Any]:
         """Return session costs ordered chronologically for the cost view."""
-        points = [
-            {
-                "session_id": summary.session_id,
-                "started_at": summary.started_at,
-                "total_cost_usd": summary.total_cost_usd,
-            }
-            for summary in reversed(actual_storage.list_sessions())
-        ]
+        points = []
+        for summary in reversed(actual_storage.list_sessions()):
+            total_cost, status = cost_summary(actual_storage.get_events(summary.session_id))
+            points.append(
+                {
+                    "session_id": summary.session_id,
+                    "started_at": summary.started_at,
+                    "total_cost_usd": total_cost,
+                    "cost_status": status,
+                }
+            )
         return {"points": points}
 
     @app.get("/api/detector-config")
@@ -642,10 +683,70 @@ def create_app(
             "halted": any(event["status"] == "diverged" for event in results),
         }
 
+    @app.get("/api/experiments/baselines")
+    def get_experiment_baselines() -> dict[str, Any]:
+        return {"baselines": list_supported_baselines(actual_storage)}
+
+    @app.get("/api/experiments")
+    def list_experiments() -> dict[str, Any]:
+        return {"experiments": actual_storage.list_experiments()}
+
+    @app.get("/api/experiments/{experiment_id}")
+    def get_experiment(experiment_id: str) -> dict[str, Any]:
+        experiment = actual_storage.get_experiment(experiment_id)
+        if not experiment:
+            raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
+        return experiment
+
+    @app.post("/api/experiments")
+    def create_guided_experiment(request: ExperimentRequest) -> dict[str, Any]:
+        if request.substitute_result is None:
+            raise HTTPException(
+                status_code=422,
+                detail="The replacement tool response must be a JSON object, not null.",
+            )
+        if not any(
+            baseline["session_id"] == request.baseline_session_id
+            for baseline in list_supported_baselines(actual_storage)
+        ):
+            if not actual_storage.get_session(request.baseline_session_id):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Baseline session '{request.baseline_session_id}' not found.",
+                )
+            raise HTTPException(
+                status_code=422,
+                detail="This session is not eligible. Guided experiments currently support "
+                "the recorded scenario-2 account workflow.",
+            )
+        try:
+            return run_counterfactual_experiment(
+                actual_storage,
+                baseline_session_id=request.baseline_session_id,
+                substitute_seq=request.substitute_seq,
+                substitute_result=request.substitute_result,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/api/experiments/counterfactual")
     def run_counterfactual() -> dict[str, Any]:
         """Run the deterministic local failure-and-recovery experiment."""
         return run_counterfactual_experiment(actual_storage)
+
+    @app.get("/api/live/status")
+    def get_live_status() -> dict[str, Any]:
+        return {
+            "execution_enabled": allow_live_runs,
+            "instrumented_recording_supported": True,
+            "monitoring_mode": "periodic session-list refresh",
+            "message": (
+                "Server-defined live scenarios are enabled."
+                if allow_live_runs
+                else "Live scenario execution is disabled by server configuration. "
+                "Instrumented agents can still record sessions into this server's storage."
+            ),
+        }
 
     @app.get("/api/live/scenarios")
     def get_live_scenarios() -> dict[str, Any]:
@@ -699,8 +800,9 @@ def create_app(
 
         details = session_service.get_session_details(session_id)
         event_count = details["event_count"] if details else capped_storage.step_count
-        cost_usd = details["total_cost_usd"] if details else 0.0
-        cost_inr = round(cost_usd * USD_TO_INR, 4)
+        cost_usd = details["total_cost_usd"] if details else None
+        cost_status = details["cost_status"] if details else "unavailable"
+        cost_inr = round(cost_usd * USD_TO_INR, 4) if cost_usd is not None else None
 
         if status == "done":
             msg = f"Completed successfully with {event_count} events."
@@ -717,6 +819,7 @@ def create_app(
             "event_count": event_count,
             "total_cost_usd": cost_usd,
             "total_cost_inr": cost_inr,
+            "cost_status": cost_status,
             "message": msg,
         }
 

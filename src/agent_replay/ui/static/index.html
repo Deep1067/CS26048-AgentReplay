@@ -19,6 +19,10 @@
       </div>
     </div>
     <div class="header-actions">
+      <button id="mobile-nav-toggle" class="btn btn-secondary mobile-nav-toggle" type="button" aria-label="Open navigation" aria-controls="app-sidebar" aria-expanded="false">☰</button>
+      <button id="session-context" class="session-context btn btn-secondary" type="button">
+        No session selected
+      </button>
       <span id="session-count-badge" class="badge badge-neutral">0 Sessions</span>
       <button id="refresh-btn" class="btn btn-secondary">↻ Refresh</button>
     </div>
@@ -30,16 +34,17 @@
       <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Collapse navigation">☰</button>
       <nav class="sidebar-nav" aria-label="Primary navigation">
         <button class="sidebar-link active" data-tab="overview"><span>⌂</span><b>Overview</b></button>
-        <button class="sidebar-link" data-tab="timeline"><span>◌</span><b>Observability / Traces</b></button>
-        <button class="sidebar-link" data-tab="sessions"><span>▤</span><b>Recorded Sessions</b></button>
-        <button class="sidebar-link" data-tab="replay"><span>↪</span><b>Replay & Fork</b></button>
+        <button class="sidebar-link" data-tab="timeline"><span>◌</span><b>Traces</b></button>
+        <button class="sidebar-link" data-tab="replay"><span>↪</span><b>Replay</b></button>
         <button class="sidebar-link" data-tab="experiment"><span>◇</span><b>Experiments</b></button>
-        <button class="sidebar-link" data-tab="cost"><span>$</span><b>Model Usage & Costs</b></button>
+        <button class="sidebar-link" data-tab="cost"><span>$</span><b>Usage & Costs</b></button>
         <button class="sidebar-link" data-tab="playground"><span>✦</span><b>AI Playground</b></button>
+        <button class="sidebar-link" data-tab="live"><span>◉</span><b>Live Monitor / Run</b></button>
+        <button class="sidebar-link" data-tab="detector"><span>⚑</span><b>Detector Rules</b></button>
       </nav>
     </aside>
     <!-- Left Sidebar: Session List -->
-    <aside class="sidebar">
+    <aside class="sidebar" id="sessions-sidebar">
       <div class="sidebar-header">
         <h2>Recorded Sessions</h2>
         <input type="text" id="session-search" placeholder="Search sessions..." class="search-input">
@@ -51,15 +56,6 @@
 
     <!-- Main Content Area: Session Details & Timeline -->
     <main class="main-content">
-      <nav class="tab-bar" aria-label="Workspace views">
-        <button class="tab-btn active" data-tab="timeline" aria-selected="true">Timeline</button>
-        <button class="tab-btn" data-tab="replay" aria-selected="false">Replay</button>
-        <button class="tab-btn" data-tab="experiment" aria-selected="false">Experiment</button>
-        <button class="tab-btn" data-tab="live" aria-selected="false">Live run</button>
-        <button class="tab-btn" data-tab="cost" aria-selected="false">Model usage & costs</button>
-        <button class="tab-btn" data-tab="detector" aria-selected="false">Detector rules</button>
-      </nav>
-
       <section id="tab-timeline" class="tab-panel active" data-panel="timeline">
         <div id="no-session-selected" class="empty-state">
           <div class="empty-icon">🔍</div>
@@ -93,31 +89,6 @@
           <div class="metric-card">
             <span class="metric-label">Recorded Cost</span>
             <span id="metric-cost" class="metric-value highlight-green">N/A</span>
-          </div>
-        </section>
-
-        <section id="tab-overview" class="tab-panel" data-panel="overview" hidden>
-          <div class="panel-card">
-            <h2>Overview</h2>
-            <p class="text-muted">Local recording health and recent activity from the AgentReplay database.</p>
-            <div id="overview-metrics" class="metrics-grid"></div>
-            <h3 class="section-heading">Recent sessions</h3>
-            <div id="overview-recent" class="overview-list"><p class="text-muted">Loading overview...</p></div>
-          </div>
-        </section>
-
-        <section id="tab-playground" class="tab-panel" data-panel="playground" hidden>
-          <div class="panel-card playground-panel">
-            <h2>AI Playground</h2>
-            <p class="text-muted">Provider calls happen only when you submit. API keys remain server-side and are never recorded.</p>
-            <div id="provider-notice" class="notice-panel">Loading provider configuration...</div>
-            <div id="playground-messages" class="playground-messages"></div>
-            <form id="playground-form" class="playground-form">
-              <select id="playground-provider" class="select-input" aria-label="Provider"></select>
-              <input id="playground-model" class="text-input" placeholder="Model (optional)">
-              <textarea id="playground-prompt" class="prompt-input" rows="4" placeholder="Ask a configured provider..." required></textarea>
-              <div class="playground-actions"><button id="playground-send" class="btn btn-primary" type="submit">Send</button><button id="playground-reset" class="btn btn-secondary" type="button">Reset</button></div>
-            </form>
           </div>
         </section>
 
@@ -159,6 +130,31 @@
         </div>
       </section>
 
+      <section id="tab-overview" class="tab-panel" data-panel="overview" hidden>
+        <div class="panel-card">
+          <h2>Overview</h2>
+          <p class="text-muted">Recorded activity and recent sessions from this Agent Replay storage.</p>
+          <div id="overview-metrics" class="metrics-grid"></div>
+          <h3 class="section-heading">Recent sessions</h3>
+          <div id="overview-recent" class="overview-list"><p class="text-muted">Loading overview...</p></div>
+        </div>
+      </section>
+
+      <section id="tab-playground" class="tab-panel" data-panel="playground" hidden>
+        <div class="panel-card playground-panel">
+          <h2>AI Playground</h2>
+          <p class="text-muted">Provider calls happen only when you submit. API keys remain server-side and are never recorded.</p>
+          <div id="provider-notice" class="notice-panel">Loading provider configuration...</div>
+          <div id="playground-messages" class="playground-messages"></div>
+          <form id="playground-form" class="playground-form">
+            <select id="playground-provider" class="select-input" aria-label="Provider"></select>
+            <input id="playground-model" class="text-input" placeholder="Model (optional)">
+            <textarea id="playground-prompt" class="prompt-input" rows="4" placeholder="Ask a configured provider..." required></textarea>
+            <div class="playground-actions"><button id="playground-send" class="btn btn-primary" type="submit">Send</button><button id="playground-reset" class="btn btn-secondary" type="button">Reset</button></div>
+          </form>
+        </div>
+      </section>
+
       <section id="tab-replay" class="tab-panel" data-panel="replay" hidden>
         <div class="panel-card">
           <h2>Replay</h2>
@@ -184,38 +180,59 @@
 
       <section id="tab-experiment" class="tab-panel" data-panel="experiment" hidden>
         <div class="panel-card">
-          <h2>Deterministic counterfactual experiment</h2>
+          <h2>Guided experiment comparison</h2>
           <p class="text-muted">
-            Runs the local failure workflow, strict replay, and a fork that substitutes the
-            account response. No model provider is used.
+            Choose a supported recorded account-workflow session, then provide a substitute
+            response for its first tool event. Strict replay reconstructs the baseline without
+            executing downstream tools; the fork executes the supported workflow after substitution.
           </p>
-          <button id="run-experiment-btn" class="btn btn-primary">Run experiment</button>
-          <div id="experiment-results" class="replay-results">
-            <p class="text-muted">Run the experiment to compare the baseline and fork.</p>
+          <div class="experiment-controls">
+            <label class="control-group">
+              <span class="metric-label">Baseline session</span>
+              <select id="experiment-baseline-select" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Substitution event</span>
+              <select id="experiment-event-select" class="select-input"></select>
+            </label>
+            <label class="control-group experiment-result-input">
+              <span class="metric-label">Replacement tool response (JSON)</span>
+              <textarea id="experiment-result-input" class="prompt-input" rows="4">{"status":"ok","balance":500.0}</textarea>
+            </label>
+            <button id="run-experiment-btn" class="btn btn-primary">Run comparison</button>
           </div>
+          <div id="experiment-results" class="replay-results">
+            <p class="text-muted">Select an eligible session above. Experiment runs are saved and can be reopened here.</p>
+          </div>
+          <h3 class="section-heading">Saved comparisons</h3>
+          <div id="experiment-history" class="experiment-history"><p class="text-muted">Loading comparisons...</p></div>
         </div>
       </section>
 
       <section id="tab-live" class="tab-panel" data-panel="live" hidden>
         <div class="panel-card">
-          <h2>Live Run</h2>
-          <p class="text-muted">Execute a server-defined agent scenario with a 5-step cap and safe internal timeout.</p>
+          <h2>Live monitoring & supported runs</h2>
+          <p id="live-capability-status" class="notice-panel">Loading server capability status...</p>
+          <p class="text-muted">Instrumented agents can write directly to this server's configured storage. This view refreshes the session list periodically; it does not report individual agent running states.</p>
           <div class="live-run-toolbar">
             <label class="control-group">
-              <span class="metric-label">Select Scenario</span>
+              <span class="metric-label">Server-defined execution scenario</span>
               <select id="live-scenario-select" class="select-input">
                 <option value="">Loading scenarios...</option>
               </select>
             </label>
-            <button id="run-live-btn" class="btn btn-primary">Run Live Scenario</button>
+            <button id="run-live-btn" class="btn btn-primary">Run supported scenario</button>
           </div>
           <div id="live-run-status" class="live-run-status hidden"></div>
+          <h3 class="section-heading">Recent recorded activity</h3>
+          <div id="live-recent-sessions" class="overview-list"><p class="text-muted">Loading recorded activity...</p></div>
         </div>
       </section>
 
       <section id="tab-cost" class="tab-panel" data-panel="cost" hidden>
         <div class="panel-card">
           <h2>Model usage & costs</h2>
+          <p class="text-muted">Costs are estimates from configured model rates unless explicitly marked otherwise; Agent Replay does not receive provider-confirmed billing totals here. Missing usage or pricing is shown as unavailable.</p>
           <div class="usage-filters">
             <label class="control-group">
               <span class="metric-label">Provider</span>
@@ -242,10 +259,11 @@
               <thead>
                 <tr>
                   <th>Provider / model</th>
-                  <th>Sessions</th>
+                  <th>Session / execution</th>
+                  <th>Events</th>
                   <th>Input tokens</th>
                   <th>Output tokens</th>
-                  <th>Cost</th>
+                  <th>Cost / status</th>
                 </tr>
               </thead>
               <tbody id="usage-table-body"></tbody>

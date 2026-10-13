@@ -170,6 +170,7 @@ def test_api_usage_filters_and_preserves_unavailable_cost():
     assert test_client.get("/api/usage?provider=missing").json() == {
         "groups": [],
         "sessions": [],
+        "records": [],
     }
 
 
@@ -300,11 +301,184 @@ def test_api_counterfactual_experiment(client):
     assert data["events"]["added"][0]["name"] == "calculate_credit"
 
 
+def test_api_guided_experiment_persists_selected_baseline_and_comparison():
+    storage = SQLiteStorage(db_path=":memory:")
+    storage.create_session("recorded-account-run")
+    storage.save_event(
+        Event(
+            session_id="recorded-account-run",
+            seq=1,
+            type="tool_call",
+            name="query_user_account",
+            args_json=json.dumps({"args": [], "kwargs": {"user_id": 101}}),
+            result_json=json.dumps(
+                {"status": "error", "message": "Database timeout connecting to replica."}
+            ),
+        )
+    )
+    test_client = TestClient(create_app(storage=storage))
+
+    baselines = test_client.get("/api/experiments/baselines").json()["baselines"]
+    assert baselines[0]["session_id"] == "recorded-account-run"
+    assert baselines[0]["substitutable_events"][0]["seq"] == 1
+
+    response = test_client.post(
+        "/api/experiments",
+        json={
+            "baseline_session_id": "recorded-account-run",
+            "substitute_seq": 1,
+            "substitute_result": {"status": "ok", "balance": 200},
+        },
+    )
+
+    assert response.status_code == 200
+    comparison = response.json()
+    assert comparison["parent_session_id"] == "recorded-account-run"
+    assert comparison["outcomes"]["strict_replay"].startswith("Agent Halted:")
+    assert comparison["outcomes"]["forked"] == {"credit_limit": 500.0}
+    assert comparison["evidence"]["strict_replay"].startswith("reconstructed")
+    assert storage.get_session_metadata(comparison["fork_session_id"]) == {
+        "forked_from": "recorded-account-run",
+        "forked_at_seq": 1,
+    }
+
+    saved = test_client.get(f"/api/experiments/{comparison['experiment_id']}")
+    assert saved.status_code == 200
+    assert saved.json()["result"]["events"] == comparison["events"]
+    assert (
+        test_client.get("/api/experiments").json()["experiments"][0]["baseline_session_id"]
+        == "recorded-account-run"
+    )
+
+
+def test_api_guided_experiment_rejects_unsupported_baseline_and_substitution(client):
+    unsupported = client.post(
+        "/api/experiments",
+        json={
+            "baseline_session_id": "sess_api_test",
+            "substitute_seq": 1,
+            "substitute_result": {"result": 42},
+        },
+    )
+    assert unsupported.status_code == 422
+    assert "not eligible" in unsupported.json()["detail"]
+
+    storage = SQLiteStorage(db_path=":memory:")
+    storage.create_session("supported-baseline")
+    storage.save_event(
+        Event(
+            session_id="supported-baseline",
+            seq=1,
+            type="tool_call",
+            name="query_user_account",
+            args_json=json.dumps({"args": [], "kwargs": {"user_id": 101}}),
+            result_json=json.dumps({"status": "error", "message": "recorded failure"}),
+        )
+    )
+    supported_client = TestClient(create_app(storage=storage))
+    invalid_result = supported_client.post(
+        "/api/experiments",
+        json={
+            "baseline_session_id": "supported-baseline",
+            "substitute_seq": 1,
+            "substitute_result": {"status": "ok"},
+        },
+    )
+    assert invalid_result.status_code == 422
+
+
 def test_api_cost_over_time(client):
     res = client.get("/api/cost-over-time")
 
     assert res.status_code == 200
     assert res.json()["points"][0]["session_id"] == "sess_api_test"
+    assert res.json()["points"][0]["total_cost_usd"] is None
+    assert res.json()["points"][0]["cost_status"] == "unavailable"
+
+
+def test_api_cost_and_usage_are_attributed_to_session_and_never_default_missing_cost_to_zero():
+    storage = SQLiteStorage(db_path=":memory:")
+    storage.create_session("priced-playground")
+    storage.save_event(
+        Event(
+            session_id="priced-playground",
+            seq=1,
+            type="model_call",
+            name="known-model",
+            model="known-model",
+            provider="test-provider",
+            args_json="{}",
+            tokens_in=12,
+            tokens_out=8,
+            cost_usd=0.0003,
+            cost_status="estimated",
+        )
+    )
+    storage.save_event(
+        Event(
+            session_id="priced-playground",
+            seq=2,
+            type="model_call",
+            name="known-model",
+            model="known-model",
+            provider="test-provider",
+            args_json="{}",
+            tokens_in=4,
+            tokens_out=5,
+            cost_usd=0.0002,
+            cost_status="estimated",
+        )
+    )
+    storage.create_session("unpriced-playground")
+    storage.save_event(
+        Event(
+            session_id="unpriced-playground",
+            seq=1,
+            type="model_call",
+            name="unknown-model",
+            model="unknown-model",
+            provider="test-provider",
+            args_json="{}",
+            tokens_in=9,
+            tokens_out=2,
+        )
+    )
+    storage.create_session("usage-missing")
+    storage.save_event(
+        Event(
+            session_id="usage-missing",
+            seq=1,
+            type="model_call",
+            name="usage-missing-model",
+            model="usage-missing-model",
+            provider="test-provider",
+            args_json="{}",
+        )
+    )
+    test_client = TestClient(create_app(storage=storage))
+
+    usage = test_client.get("/api/usage").json()
+
+    priced = next(row for row in usage["records"] if row["session_id"] == "priced-playground")
+    unpriced = next(row for row in usage["records"] if row["session_id"] == "unpriced-playground")
+    missing = next(row for row in usage["records"] if row["session_id"] == "usage-missing")
+    assert priced["input_tokens"] == 16
+    assert priced["output_tokens"] == 13
+    assert priced["event_count"] == 2
+    assert priced["cost_usd"] == 0.0005
+    assert priced["cost_status"] == "estimated"
+    assert unpriced["cost_usd"] is None
+    assert unpriced["cost_status"] == "unavailable"
+    assert missing["input_tokens"] is None
+    assert missing["output_tokens"] is None
+    assert missing["usage_available"] is False
+    session_rows = {row["session_id"]: row for row in test_client.get("/api/sessions").json()}
+    assert session_rows["unpriced-playground"]["total_cost_usd"] is None
+    assert session_rows["unpriced-playground"]["cost_status"] == "unavailable"
+    assert test_client.get("/api/sessions/priced-playground").json()["total_cost_usd"] == 0.0005
+    known_group = next(group for group in usage["groups"] if group["model"] == "known-model")
+    assert known_group["sessions"] == 1
+    assert known_group["cost_usd"] == 0.0005
 
 
 def test_api_updates_prices_in_inr(tmp_path, monkeypatch):
@@ -390,6 +564,12 @@ def test_api_config_mutations_disabled_do_not_change_configuration(client):
 
 
 def test_api_live_run_disabled_by_default(client):
+    capability = client.get("/api/live/status")
+    assert capability.status_code == 200
+    assert capability.json()["execution_enabled"] is False
+    assert capability.json()["instrumented_recording_supported"] is True
+    assert "disabled" in capability.json()["message"]
+
     res = client.post("/api/live/run", json={"scenario_id": "scenario_1_loop"})
     assert res.status_code == 503
     assert res.json()["detail"] == "Live execution is not enabled on this server."

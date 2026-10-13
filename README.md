@@ -99,8 +99,8 @@ DEFAULT_MODEL=gemini-2.0-flash
 The dashboard remains useful without any provider key: local recording, strict replay,
 counterfactual experiments, timeline inspection, and analytics do not make paid network calls.
 The AI Playground calls a provider only after the user submits a prompt. Provider responses and
-prompts are recorded in the selected session for debugging, so do not submit secrets or personal
-data. Usage and cost displays label unavailable pricing instead of treating it as zero.
+prompts are recorded in a dedicated Playground session for debugging, so do not submit secrets or
+personal data. Usage and cost displays label unavailable pricing instead of treating it as zero.
 
 Configure or customize token prices in `prices.json`:
 ```json
@@ -138,7 +138,19 @@ python scenarios/scenario_2_malformed_response.py
 2. **Strict Runtime Replay**: Runs the decorated workflow against stored responses without invoking the underlying tool.
 3. **Forked Runtime Execution**: Substitutes sequence #1 with valid account data (`{"status": "ok", "balance": 500.0}`), then executes the real downstream `calculate_credit` tool and persists a separate fork session.
 
-To run the complete comparison through the UI, start the server and open the **Experiment** tab, then choose **Run experiment**. The result identifies the parent and fork sessions, outcomes, substituted event, and changed/added/removed events. Duration is the recorded local wall-clock timing for this synthetic scenario, not a provider performance benchmark. `POST /api/replay` remains trace validation only; it does not re-execute an agent workflow.
+To compare an existing supported baseline in the UI, open **Experiments**, select a recorded
+scenario-2 account-workflow session, choose its first tool-call substitution, and submit a JSON
+replacement response. The comparison stores its baseline/fork relationship and complete result so
+it can be reopened after navigating away or reloading. The fork uses the existing deterministic
+replay context, substitutes the first `query_user_account` result, and executes the supported
+downstream workflow; it does not run arbitrary recorded agent graphs. The comparison identifies
+the recorded baseline, strict replay reconstruction, fork outcome, substituted event, and event
+diff. Recorded per-event durations are not a performance benchmark.
+
+`POST /api/replay` remains trace validation only; it does not re-execute an agent workflow.
+Guided experiment endpoints are `GET /api/experiments/baselines`, `POST /api/experiments`,
+`GET /api/experiments`, and `GET /api/experiments/{experiment_id}`. The older
+`POST /api/experiments/counterfactual` endpoint remains available for compatibility.
 
 ---
 
@@ -151,15 +163,25 @@ uvicorn agent_replay.api:app --reload --host 127.0.0.1 --port 8000
 Open your browser to: **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
 
 ### Features:
-- **Session Explorer**: Browse past sessions with start time, duration, and total USD cost.
+- **Session Explorer**: Browse past sessions with start time, duration, and cost availability.
 - **Metric Cards**: Aggregate tokens, costs, durations, and tool vs model call ratios.
 - **Flagged Badges**: Warning and Danger alert banners for anomaly sessions.
 - **Chronological Timeline**: Step-by-step visual cards with duration badges, cost pills, and collapsible JSON payloads for both inputs and outputs.
 - **Culprit Highlighting**: Cards identified by anomaly rules glow with red borders and `[FLAGGED]` pills.
-- **Model Usage & Costs**: Filter recorded model usage by provider, model, and session. Costs are
-  marked unavailable when token usage or an explicit model rate is missing.
+- **Guided Experiments**: Compare eligible recorded account-workflow baselines with persisted,
+  deterministic forks. Strict replay, substituted output, and downstream fork execution are
+  labeled separately. Other recorded agent workflows are not currently eligible.
+- **Model Usage & Costs**: Filter recorded model usage by provider, model, and execution session.
+  Per-session records avoid conflating a baseline with its fork. Configured-rate values are
+  estimates, not provider-confirmed bills; missing usage or pricing remains unavailable.
 - **AI Playground**: Exercise configured OpenAI, Anthropic, or Gemini adapters from the server,
-  with failed provider calls recorded as failed sessions.
+  with each submitted run recorded as its own session and failed provider calls recorded as failed
+  events. Provider keys stay server-side.
+- **Live Monitor / Run**: Refresh the configured server's recorded-session list periodically.
+  This is not a stream of per-event state and does not imply that an agent is currently running.
+  Scenario execution remains disabled unless `LIVE_RUN_ENABLED` is explicitly enabled.
+- **Navigation**: A collapsible sidebar selects one workspace view at a time; the selected session
+  remains available as shared context and the session list is shown on Traces.
 
 ## ☁️ Vercel Deployment
 
@@ -177,7 +199,12 @@ CONFIG_MUTATIONS_ENABLED
 
 Import `Deep1067/CS26048-AgentReplay` into Vercel with the repository root as the project directory. The first application startup creates the required sessions, events, and settings tables automatically. Pricing and detector settings are stored in the database when Turso is configured; local development continues to use SQLite and local configuration files.
 
-`LIVE_RUN_ENABLED` and `CONFIG_MUTATIONS_ENABLED` default to `false`. Set them to `true` only in a trusted local environment; the application does not use a browser-visible shared secret for authorization. The deterministic scenarios can still be run directly with the commands above when live execution is disabled.
+`LIVE_RUN_ENABLED` and `CONFIG_MUTATIONS_ENABLED` default to `false`. Set them to `true` only in a
+trusted local environment; the application does not use a browser-visible shared secret for
+authorization. The built-in monitor can still refresh recorded sessions and instrumented
+integrations can still record into the configured storage when scenario execution is disabled.
+Scenario execution remains limited to server-defined, step-capped workflows; this switch does not
+enable arbitrary task execution.
 
 ---
 

@@ -104,6 +104,15 @@ class SQLiteStorage:
                         value_json TEXT NOT NULL
                     );
                 """)
+                self._conn.execute("""
+                    CREATE TABLE IF NOT EXISTS experiments (
+                        experiment_id TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        baseline_session_id TEXT NOT NULL,
+                        fork_session_id TEXT NOT NULL,
+                        result_json TEXT NOT NULL
+                    );
+                """)
 
     def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> str:
         now = datetime.now(UTC).isoformat()
@@ -322,3 +331,73 @@ class SQLiteStorage:
                     """,
                     (key, value_json),
                 )
+
+    def create_experiment(
+        self,
+        experiment_id: str,
+        baseline_session_id: str,
+        fork_session_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        created_at = datetime.now(UTC).isoformat()
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO experiments (
+                        experiment_id, created_at, baseline_session_id, fork_session_id,
+                        result_json
+                    ) VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (
+                        experiment_id,
+                        created_at,
+                        baseline_session_id,
+                        fork_session_id,
+                        json.dumps(result),
+                    ),
+                )
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT experiment_id, created_at, baseline_session_id, fork_session_id,
+                    result_json
+                FROM experiments WHERE experiment_id = ?;
+                """,
+                (experiment_id,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            result = json.loads(row["result_json"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        return {
+            "experiment_id": row["experiment_id"],
+            "created_at": row["created_at"],
+            "baseline_session_id": row["baseline_session_id"],
+            "fork_session_id": row["fork_session_id"],
+            "result": result,
+        }
+
+    def list_experiments(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT experiment_id, created_at, baseline_session_id, fork_session_id
+                FROM experiments ORDER BY created_at DESC;
+                """
+            ).fetchall()
+        return [
+            {
+                "experiment_id": row["experiment_id"],
+                "created_at": row["created_at"],
+                "baseline_session_id": row["baseline_session_id"],
+                "fork_session_id": row["fork_session_id"],
+            }
+            for row in rows
+        ]

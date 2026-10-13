@@ -2,11 +2,15 @@ document.addEventListener("DOMContentLoaded", () => {
   let allSessions = [];
   let currentSessionData = null;
   let currentFilter = "all";
+  let liveMonitorTimer = null;
+  let liveExecutionEnabled = false;
 
   const sessionSearchInput = document.getElementById("session-search");
   const sessionsListEl = document.getElementById("sessions-list");
   const refreshBtn = document.getElementById("refresh-btn");
   const sessionCountBadge = document.getElementById("session-count-badge");
+  const sessionContext = document.getElementById("session-context");
+  const sessionsSidebar = document.getElementById("sessions-sidebar");
 
   const noSessionEl = document.getElementById("no-session-selected");
   const sessionDetailEl = document.getElementById("session-detail-view");
@@ -28,6 +32,10 @@ document.addEventListener("DOMContentLoaded", () => {
   const replayResultsEl = document.getElementById("replay-results");
   const runExperimentBtn = document.getElementById("run-experiment-btn");
   const experimentResultsEl = document.getElementById("experiment-results");
+  const experimentBaselineSelect = document.getElementById("experiment-baseline-select");
+  const experimentEventSelect = document.getElementById("experiment-event-select");
+  const experimentResultInput = document.getElementById("experiment-result-input");
+  const experimentHistoryEl = document.getElementById("experiment-history");
   const pricingExchangeNote = document.getElementById("pricing-exchange-note");
   const pricingTableBody = document.getElementById("pricing-table-body");
   const savePricingBtn = document.getElementById("save-pricing-btn");
@@ -38,6 +46,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const liveScenarioSelect = document.getElementById("live-scenario-select");
   const runLiveBtn = document.getElementById("run-live-btn");
   const liveRunStatusEl = document.getElementById("live-run-status");
+  const liveCapabilityStatus = document.getElementById("live-capability-status");
+  const liveRecentSessions = document.getElementById("live-recent-sessions");
 
   const filterBtns = document.querySelectorAll(".filter-btn");
   const tabBtns = document.querySelectorAll(".tab-btn");
@@ -45,6 +55,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const sidebarLinks = document.querySelectorAll(".sidebar-link");
   const sidebar = document.getElementById("app-sidebar");
   const sidebarToggle = document.getElementById("sidebar-toggle");
+  const mobileNavToggle = document.getElementById("mobile-nav-toggle");
   const sidebarOverlay = document.getElementById("sidebar-overlay");
   const overviewMetrics = document.getElementById("overview-metrics");
   const overviewRecent = document.getElementById("overview-recent");
@@ -60,7 +71,15 @@ document.addEventListener("DOMContentLoaded", () => {
   const usageSessionFilter = document.getElementById("usage-session-filter");
   const usageTableBody = document.getElementById("usage-table-body");
 
+  function formatCost(value, status) {
+    if (status === "unavailable" || value == null) return "Unavailable";
+    const prefix = status === "estimated" ? "≈ " : "";
+    return `${prefix}$${Number(value).toFixed(8)} (${status})`;
+  }
+
   function switchTab(tabName) {
+    const validTabs = new Set(["overview", "timeline", "replay", "experiment", "live", "cost", "detector", "playground"]);
+    if (!validTabs.has(tabName)) tabName = "overview";
     tabBtns.forEach(btn => {
       const isActive = btn.dataset.tab === tabName;
       btn.classList.toggle("active", isActive);
@@ -73,61 +92,76 @@ document.addEventListener("DOMContentLoaded", () => {
       panel.hidden = !isActive;
     });
     sidebarLinks.forEach(link => link.classList.toggle("active", link.dataset.tab === tabName));
+    sessionsSidebar.classList.toggle("hidden", tabName !== "timeline");
+    sessionContext.textContent = currentSessionData
+      ? `Session: ${currentSessionData.session_id}`
+      : "No session selected";
+    sessionContext.disabled = !currentSessionData;
     window.localStorage.setItem("agent-replay-section", tabName);
     if (window.matchMedia("(max-width: 850px)").matches) {
       sidebar.classList.remove("mobile-open");
       sidebarOverlay.hidden = true;
+      mobileNavToggle.setAttribute("aria-expanded", "false");
+      mobileNavToggle.setAttribute("aria-label", "Open navigation");
     }
     if (tabName === "overview") fetchOverview();
     if (tabName === "playground") fetchProviders();
+    if (tabName === "experiment") {
+      fetchExperimentBaselines();
+      fetchExperimentHistory();
+    }
     if (tabName === "cost") {
       fetchPricing();
       fetchCostHistory();
+      if (currentSessionData && !usageSessionFilter.value) {
+        if (![...usageSessionFilter.options].some(option => option.value === currentSessionData.session_id)) {
+          const option = document.createElement("option");
+          option.value = currentSessionData.session_id;
+          option.textContent = currentSessionData.session_id;
+          usageSessionFilter.appendChild(option);
+        }
+        usageSessionFilter.value = currentSessionData.session_id;
+      }
       fetchUsage();
     }
+    if (tabName === "live") {
+      fetchLiveScenarios();
+      refreshLiveMonitor();
+      if (liveMonitorTimer === null) {
+        liveMonitorTimer = window.setInterval(refreshLiveMonitor, 5000);
+      }
+    } else if (liveMonitorTimer !== null) {
+      window.clearInterval(liveMonitorTimer);
+      liveMonitorTimer = null;
+    }
+    if (tabName === "detector") fetchDetectorConfig();
+  }
 
-    async function fetchUsage() {
+  async function fetchUsage() {
       const summary = document.getElementById("usage-summary");
       try {
         const params = new URLSearchParams();
         if (usageProviderFilter.value) params.set("provider", usageProviderFilter.value);
         if (usageModelFilter.value) params.set("model", usageModelFilter.value);
         if (usageSessionFilter.value) params.set("session_id", usageSessionFilter.value);
-        const data = await (await fetch(`/api/usage?${params}`)).json();
-        summary.replaceChildren();
-        if (!data.groups.length) {
-          summary.textContent = "No recorded model usage is available yet. Configure a provider and submit a playground request.";
-          usageTableBody.replaceChildren();
-          return;
-        }
-        usageTableBody.replaceChildren();
-        data.groups.forEach(group => {
-          const tableRow = document.createElement("tr");
-          const cost = group.cost_status === "unavailable"
-            ? "Unavailable"
-            : `$${group.cost_usd.toFixed(8)} (${group.cost_status})`;
-          [
-            `${group.provider} / ${group.model}`,
-            group.sessions,
-            group.input_tokens,
-            group.output_tokens,
-            cost,
-          ].forEach(value => {
-            const cell = document.createElement("td");
-            cell.textContent = String(value);
-            tableRow.appendChild(cell);
-          });
-          usageTableBody.appendChild(tableRow);
-          const row = document.createElement("div");
-          row.className = "usage-row";
-          row.textContent = `${group.provider} / ${group.model} · ${group.input_tokens} in · ${group.output_tokens} out · ${cost}`;
-          summary.appendChild(row);
-        });
+        const response = await fetch(`/api/usage?${params}`);
+        if (!response.ok) throw new Error("Failed to load model usage.");
+        const data = await response.json();
         if (!usageProviderFilter.dataset.loaded) {
-          const providers = [...new Set(data.groups.map(group => group.provider))].sort();
-          const models = [...new Set(data.groups.map(group => group.model))].sort();
-          const sessions = data.sessions.map(session => session.session_id).sort();
-          for (const [select, values] of [[usageProviderFilter, providers], [usageModelFilter, models], [usageSessionFilter, sessions]]) {
+          let filterData = data;
+          if (params.toString()) {
+            const allResponse = await fetch("/api/usage");
+            if (!allResponse.ok) throw new Error("Failed to load usage filter options.");
+            filterData = await allResponse.json();
+          }
+          const providers = [...new Set(filterData.records.map(record => record.provider))].sort();
+          const models = [...new Set(filterData.records.map(record => record.model))].sort();
+          const sessions = [...new Set(filterData.records.map(record => record.session_id))].sort();
+          for (const [select, values] of [
+            [usageProviderFilter, providers],
+            [usageModelFilter, models],
+            [usageSessionFilter, sessions],
+          ]) {
             values.forEach(value => {
               const option = document.createElement("option");
               option.value = value;
@@ -137,14 +171,48 @@ document.addEventListener("DOMContentLoaded", () => {
           }
           usageProviderFilter.dataset.loaded = "true";
         }
+        summary.replaceChildren();
+        if (!data.groups.length) {
+          summary.textContent = "No recorded model usage is available for these filters. Configure a provider and submit a Playground request, or select a session with model calls.";
+          usageTableBody.replaceChildren();
+          return;
+  }
+        usageTableBody.replaceChildren();
+        (data.records || []).forEach(record => {
+          const tableRow = document.createElement("tr");
+          const cost = formatCost(record.cost_usd, record.cost_status);
+          [
+            `${record.provider} / ${record.model}`,
+            record.session_id,
+            record.event_count,
+            record.usage_available ? record.input_tokens : "Unavailable",
+            record.usage_available ? record.output_tokens : "Unavailable",
+            cost,
+          ].forEach(value => {
+            const cell = document.createElement("td");
+            cell.textContent = String(value);
+            tableRow.appendChild(cell);
+          });
+          usageTableBody.appendChild(tableRow);
+          const row = document.createElement("div");
+          row.className = "usage-row";
+          row.textContent = `${record.session_id} · ${record.provider} / ${record.model} · ${
+            record.usage_available
+              ? `${record.input_tokens} in · ${record.output_tokens} out`
+              : "token usage unavailable"
+          } · ${cost}`;
+          summary.appendChild(row);
+        });
       } catch (err) {
         summary.textContent = `Unable to load model usage: ${err.message}`;
       }
     }
 
-    async function fetchOverview() {
+  async function fetchOverview() {
       try {
-        const data = await (await fetch("/api/overview")).json();
+        const response = await fetch("/api/overview");
+        if (!response.ok) throw new Error("Failed to load overview.");
+        const data = await response.json();
         overviewMetrics.replaceChildren();
         [
           ["Recorded sessions", data.session_count],
@@ -171,9 +239,9 @@ document.addEventListener("DOMContentLoaded", () => {
       } catch (err) {
         overviewRecent.textContent = `Unable to load overview: ${err.message}`;
       }
-    }
+  }
 
-    async function fetchProviders() {
+  async function fetchProviders() {
       try {
         const data = await (await fetch("/api/providers")).json();
         playgroundProvider.replaceChildren();
@@ -190,7 +258,7 @@ document.addEventListener("DOMContentLoaded", () => {
           : "No provider API keys are configured. Offline recording, replay, and experiments remain available.";
       } catch (err) {
         providerNotice.textContent = `Unable to load provider configuration: ${err.message}`;
-      }
+  }
     }
 
     playgroundForm.addEventListener("submit", async event => {
@@ -222,24 +290,30 @@ document.addEventListener("DOMContentLoaded", () => {
       } finally {
         playgroundSend.disabled = false;
       }
-    });
-    document.getElementById("playground-reset").addEventListener("click", () => playgroundMessages.replaceChildren());
-    sidebarToggle.addEventListener("click", () => {
-      if (window.matchMedia("(max-width: 850px)").matches) {
-        sidebar.classList.toggle("mobile-open");
-        sidebarOverlay.hidden = !sidebar.classList.contains("mobile-open");
-      } else {
-        sidebar.classList.toggle("collapsed");
-      }
-    });
-    sidebarOverlay.addEventListener("click", () => {
-      sidebar.classList.remove("mobile-open");
-      sidebarOverlay.hidden = true;
-    });
-    sidebarLinks.forEach(link => link.addEventListener("click", () => switchTab(link.dataset.tab === "sessions" ? "timeline" : link.dataset.tab)));
-    if (tabName === "detector") fetchDetectorConfig();
-    if (tabName === "live") fetchLiveScenarios();
+  });
+  document.getElementById("playground-reset").addEventListener("click", () => playgroundMessages.replaceChildren());
+  sidebarToggle.addEventListener("click", () => {
+    if (window.matchMedia("(max-width: 850px)").matches) {
+      toggleMobileNavigation();
+    } else {
+      sidebar.classList.toggle("collapsed");
+      window.localStorage.setItem("agent-replay-sidebar-collapsed", String(sidebar.classList.contains("collapsed")));
+    }
+  });
+  function toggleMobileNavigation() {
+    const isOpen = sidebar.classList.toggle("mobile-open");
+    sidebarOverlay.hidden = !isOpen;
+    mobileNavToggle.setAttribute("aria-expanded", String(isOpen));
+    mobileNavToggle.setAttribute("aria-label", isOpen ? "Close navigation" : "Open navigation");
   }
+  mobileNavToggle.addEventListener("click", toggleMobileNavigation);
+  sidebarOverlay.addEventListener("click", () => {
+    sidebar.classList.remove("mobile-open");
+    sidebarOverlay.hidden = true;
+    mobileNavToggle.setAttribute("aria-expanded", "false");
+    mobileNavToggle.setAttribute("aria-label", "Open navigation");
+  });
+  sidebarLinks.forEach(link => link.addEventListener("click", () => switchTab(link.dataset.tab)));
 
   const detectorFields = [
     ["max_repeated_tool_calls", "Repeat-call count", "1"],
@@ -378,10 +452,15 @@ document.addEventListener("DOMContentLoaded", () => {
       track.className = "cost-history-track";
       const bar = document.createElement("div");
       bar.className = "cost-history-bar";
-      bar.style.width = `${maxCost ? (point.total_cost_usd / maxCost) * 100 : 2}%`;
+      bar.style.width = `${
+        point.total_cost_usd != null && maxCost
+          ? (point.total_cost_usd / maxCost) * 100
+          : 0
+      }%`;
+      if (point.total_cost_usd == null) bar.style.display = "none";
       track.appendChild(bar);
       const value = document.createElement("span");
-      value.textContent = `$${Number(point.total_cost_usd).toFixed(6)}`;
+      value.textContent = formatCost(point.total_cost_usd, point.cost_status);
       row.append(label, track, value);
       costHistoryEl.appendChild(row);
     });
@@ -500,9 +579,9 @@ document.addEventListener("DOMContentLoaded", () => {
       `Fork session: ${data.fork_session_id}`,
       `Substituted event: #${data.substitution.seq} ${JSON.stringify(data.substitution.result)}`,
       "",
-      `Baseline outcome: ${JSON.stringify(data.outcomes.baseline)}`,
-      `Strict replay outcome: ${JSON.stringify(data.outcomes.strict_replay)}`,
-      `Forked outcome: ${JSON.stringify(data.outcomes.forked)}`,
+      `Baseline (${data.evidence?.baseline || "recorded workflow"}): ${JSON.stringify(data.outcomes.baseline)}`,
+      `Strict replay (${data.evidence?.strict_replay || "recorded-result replay"}): ${JSON.stringify(data.outcomes.strict_replay)}`,
+      `Forked execution (${data.evidence?.forked || "execution after substitution"}): ${JSON.stringify(data.outcomes.forked)}`,
       "",
       `Changed events: ${data.events.changed.length}`,
       `Added events: ${data.events.added.length}`,
@@ -513,8 +592,8 @@ document.addEventListener("DOMContentLoaded", () => {
         ? `Token delta: ${data.metrics.tokens.forked_in - data.metrics.tokens.baseline_in} in / ${data.metrics.tokens.forked_out - data.metrics.tokens.baseline_out} out`
         : "Tokens: unavailable; no comparable model usage was recorded.",
       data.metrics.cost_usd_estimate.available
-        ? `Estimated cost delta: $${data.metrics.cost_usd_estimate.delta}`
-        : "Estimated cost: unavailable; no comparable model usage was recorded.",
+        ? `Cost delta: ${formatCost(data.metrics.cost_usd_estimate.delta, data.metrics.cost_usd_estimate.status)}`
+        : "Cost: unavailable; no comparable model cost was recorded.",
       "",
       "Event differences:",
       JSON.stringify(
@@ -536,7 +615,104 @@ document.addEventListener("DOMContentLoaded", () => {
         switchTab("timeline");
       });
       experimentResultsEl.appendChild(button);
+      const usageButton = document.createElement("button");
+      usageButton.type = "button";
+      usageButton.className = "btn btn-secondary";
+      usageButton.textContent = `Usage for ${sessionId}`;
+      usageButton.addEventListener("click", () => {
+        switchTab("cost");
+        if (![...usageSessionFilter.options].some(option => option.value === sessionId)) {
+          const option = document.createElement("option");
+          option.value = sessionId;
+          option.textContent = sessionId;
+          usageSessionFilter.appendChild(option);
+        }
+        usageSessionFilter.value = sessionId;
+        fetchUsage();
+      });
+      experimentResultsEl.appendChild(usageButton);
     });
+  }
+
+  async function fetchExperimentBaselines() {
+    experimentBaselineSelect.replaceChildren();
+    experimentEventSelect.replaceChildren();
+    try {
+      const response = await fetch("/api/experiments/baselines");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Unable to load eligible baselines.");
+      if (!data.baselines.length) {
+        const option = document.createElement("option");
+        option.textContent = "No supported session available";
+        option.value = "";
+        experimentBaselineSelect.appendChild(option);
+        runExperimentBtn.disabled = true;
+        experimentResultsEl.textContent =
+          "No eligible baseline found. Guided comparisons currently require a recorded scenario-2 account workflow.";
+        return;
+      }
+      data.baselines.forEach(baseline => {
+        const option = document.createElement("option");
+        option.value = baseline.session_id;
+        option.textContent = `${baseline.session_id} · ${baseline.event_count} events`;
+        experimentBaselineSelect.appendChild(option);
+      });
+      experimentBaselineSelect.dataset.baselines = JSON.stringify(data.baselines);
+      if (currentSessionData && data.baselines.some(item => item.session_id === currentSessionData.session_id)) {
+        experimentBaselineSelect.value = currentSessionData.session_id;
+      }
+      updateExperimentEventOptions();
+      runExperimentBtn.disabled = false;
+    } catch (err) {
+      experimentResultsEl.textContent = `Unable to load experiment baselines: ${err.message}`;
+      runExperimentBtn.disabled = true;
+    }
+  }
+
+  function updateExperimentEventOptions() {
+    const baselines = JSON.parse(experimentBaselineSelect.dataset.baselines || "[]");
+    const baseline = baselines.find(item => item.session_id === experimentBaselineSelect.value);
+    experimentEventSelect.replaceChildren();
+    (baseline?.substitutable_events || []).forEach(event => {
+      const option = document.createElement("option");
+      option.value = event.seq;
+      option.textContent = `#${event.seq} ${event.type}: ${event.name}`;
+      experimentEventSelect.appendChild(option);
+    });
+  }
+
+  async function fetchExperimentHistory() {
+    try {
+      const response = await fetch("/api/experiments");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Unable to load saved comparisons.");
+      experimentHistoryEl.replaceChildren();
+      if (!data.experiments.length) {
+        experimentHistoryEl.textContent = "No saved comparisons yet.";
+        return;
+      }
+      data.experiments.forEach(experiment => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "overview-session";
+        button.textContent = `${experiment.experiment_id} · ${experiment.baseline_session_id} → ${experiment.fork_session_id}`;
+        button.addEventListener("click", () => openSavedExperiment(experiment.experiment_id));
+        experimentHistoryEl.appendChild(button);
+      });
+    } catch (err) {
+      experimentHistoryEl.textContent = `Unable to load saved comparisons: ${err.message}`;
+    }
+  }
+
+  async function openSavedExperiment(experimentId) {
+    try {
+      const response = await fetch(`/api/experiments/${encodeURIComponent(experimentId)}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Unable to load this comparison.");
+      renderExperiment(data.result);
+    } catch (err) {
+      experimentResultsEl.textContent = `Unable to open comparison: ${err.message}`;
+    }
   }
 
   async function runExperiment() {
@@ -544,15 +720,28 @@ document.addEventListener("DOMContentLoaded", () => {
     const timeoutId = window.setTimeout(() => controller.abort(), 30000);
     try {
       runExperimentBtn.disabled = true;
-      experimentResultsEl.textContent = "Running deterministic experiment...";
-      const res = await fetch("/api/experiments/counterfactual", {
+      let substituteResult;
+      try {
+        substituteResult = JSON.parse(experimentResultInput.value);
+      } catch (_) {
+        throw new Error("Replacement response must be valid JSON.");
+      }
+      experimentResultsEl.textContent = "Running strict replay and supported fork execution...";
+      const res = await fetch("/api/experiments", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseline_session_id: experimentBaselineSelect.value,
+          substitute_seq: Number(experimentEventSelect.value),
+          substitute_result: substituteResult,
+        }),
         signal: controller.signal,
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Experiment failed");
       renderExperiment(data);
       await fetchSessions();
+      await fetchExperimentHistory();
     } catch (err) {
       const message =
         err.name === "AbortError" ? "The experiment timed out." : err.message;
@@ -607,8 +796,8 @@ document.addEventListener("DOMContentLoaded", () => {
       const eventMeta = document.createElement("span");
       eventMeta.textContent = `${sess.event_count} events · ${dateStr}`;
       const cost = document.createElement("span");
-      cost.className = "cost-pill";
-      cost.textContent = `$${Number(sess.total_cost_usd || 0).toFixed(6)}`;
+      cost.className = `cost-pill ${sess.cost_status === "unavailable" ? "unavailable" : ""}`;
+      cost.textContent = formatCost(sess.total_cost_usd, sess.cost_status);
       footer.append(eventMeta, cost);
       item.append(header, footer);
 
@@ -624,6 +813,8 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!res.ok) throw new Error("Failed to load session details");
       currentSessionData = await res.json();
       replaySessionSelect.value = sessionId;
+      sessionContext.textContent = `Session: ${sessionId}`;
+      sessionContext.disabled = false;
 
       noSessionEl.classList.add("hidden");
       sessionDetailEl.classList.remove("hidden");
@@ -639,9 +830,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function renderSessionMetrics(data) {
     metricSessionId.textContent = data.session_id;
-    metricCost.textContent = data.metrics_available?.cost
-      ? `$${Number(data.total_cost_usd).toFixed(6)}`
-      : "N/A";
+    metricCost.textContent = formatCost(data.total_cost_usd, data.cost_status);
     metricDuration.textContent = data.total_duration_ms != null
       ? `${data.total_duration_ms} ms`
       : "N/A";
@@ -777,7 +966,9 @@ document.addEventListener("DOMContentLoaded", () => {
       durationTrack.appendChild(durationBar);
       const cost = document.createElement("span");
       cost.className = "cost-pill";
-      cost.textContent = `$${Number(e.cost_usd || 0).toFixed(6)}`;
+      cost.textContent = e.type === "model_call"
+        ? formatCost(e.cost_usd, e.cost_status)
+        : "—";
       metaGroup.append(duration, durationTrack, cost);
       header.append(titleGroup, metaGroup);
       card.append(node, header);
@@ -821,7 +1012,15 @@ document.addEventListener("DOMContentLoaded", () => {
   async function fetchLiveScenarios() {
     if (!liveScenarioSelect) return;
     try {
-      const res = await fetch("/api/live/scenarios");
+      const [statusResponse, res] = await Promise.all([
+        fetch("/api/live/status"),
+        fetch("/api/live/scenarios"),
+      ]);
+      if (!statusResponse.ok) throw new Error("Unable to load live capability status.");
+      const capability = await statusResponse.json();
+      liveCapabilityStatus.textContent = capability.message;
+      liveExecutionEnabled = capability.execution_enabled;
+      runLiveBtn.disabled = !liveExecutionEnabled;
       if (!res.ok) throw new Error("Failed to load live scenarios");
       const scenarios = await res.json();
       liveScenarioSelect.replaceChildren();
@@ -829,9 +1028,17 @@ document.addEventListener("DOMContentLoaded", () => {
         const option = document.createElement("option");
         option.value = id;
         option.textContent = `${details.label} — ${details.description} (${details.expected_duration})`;
+        option.disabled = !capability.execution_enabled;
         liveScenarioSelect.appendChild(option);
       });
+      if (!capability.execution_enabled) {
+        liveRunStatusEl.textContent = "Scenario execution is disabled by server configuration.";
+        liveRunStatusEl.className = "live-run-status hidden";
+      }
     } catch (err) {
+      liveExecutionEnabled = false;
+      runLiveBtn.disabled = true;
+      liveCapabilityStatus.textContent = `Unable to load live capability status: ${err.message}`;
       liveScenarioSelect.replaceChildren();
       const errOpt = document.createElement("option");
       errOpt.textContent = `Error loading scenarios: ${err.message}`;
@@ -839,8 +1046,43 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  async function refreshLiveMonitor() {
+    try {
+      const response = await fetch("/api/sessions");
+      if (!response.ok) throw new Error("Unable to refresh recorded activity.");
+      allSessions = await response.json();
+      sessionCountBadge.textContent = `${allSessions.length} Sessions`;
+      populateReplaySessions(allSessions);
+      renderSessionsList(allSessions);
+      renderLiveRecentSessions(allSessions.slice(0, 8));
+    } catch (err) {
+      liveRecentSessions.textContent = `Unable to refresh recorded activity: ${err.message}`;
+    }
+  }
+
+  function renderLiveRecentSessions(sessions) {
+    liveRecentSessions.replaceChildren();
+    if (!sessions.length) {
+      liveRecentSessions.textContent = "No recorded sessions are available yet.";
+      return;
+    }
+    sessions.forEach(session => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "overview-session";
+      button.textContent = `${session.session_id} · ${session.event_count} events · ${
+        session.has_errors ? "contains errors" : "no recorded errors"
+      }`;
+      button.addEventListener("click", async () => {
+        await selectSession(session.session_id);
+        switchTab("timeline");
+      });
+      liveRecentSessions.appendChild(button);
+    });
+  }
+
   async function runLiveScenario() {
-    if (!liveScenarioSelect || !liveScenarioSelect.value) return;
+    if (!liveScenarioSelect || !liveScenarioSelect.value || runLiveBtn.disabled) return;
     const scenarioId = liveScenarioSelect.value;
     try {
       runLiveBtn.disabled = true;
@@ -865,7 +1107,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
       if (res.ok && (data.status === "done" || data.status === "step_limit_reached")) {
         liveRunStatusEl.className = "live-run-status done";
-        msgSpan.textContent = `Done - ${data.event_count} events, cost Rs. ${data.total_cost_inr}`;
+        msgSpan.textContent = `Done — ${data.event_count} events; cost ${formatCost(data.total_cost_usd, data.cost_status)}.`;
       } else if (res.ok && data.status === "timed_out") {
         liveRunStatusEl.className = "live-run-status timed_out";
         msgSpan.textContent = `Timed out after ${data.event_count} events - partial session saved`;
@@ -882,6 +1124,7 @@ document.addEventListener("DOMContentLoaded", () => {
         linkBtn.textContent = `View timeline (${data.session_id}) →`;
         linkBtn.addEventListener("click", async () => {
           await fetchSessions();
+          await refreshLiveMonitor();
           await selectSession(data.session_id);
           switchTab("timeline");
         });
@@ -896,7 +1139,7 @@ document.addEventListener("DOMContentLoaded", () => {
       errSpan.textContent = `Error: ${err.message}`;
       liveRunStatusEl.appendChild(errSpan);
     } finally {
-      runLiveBtn.disabled = false;
+      runLiveBtn.disabled = !liveExecutionEnabled;
       liveScenarioSelect.disabled = false;
     }
   }
@@ -909,6 +1152,21 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   refreshBtn.addEventListener("click", fetchSessions);
+  sessionContext.addEventListener("click", () => {
+    if (currentSessionData) switchTab("timeline");
+  });
+  sidebar.classList.toggle(
+    "collapsed",
+    window.localStorage.getItem("agent-replay-sidebar-collapsed") === "true"
+  );
+  experimentBaselineSelect.addEventListener("change", updateExperimentEventOptions);
+  [usageProviderFilter, usageModelFilter, usageSessionFilter].forEach(filter => {
+    filter.addEventListener("change", () => {
+      if (document.querySelector('[data-panel="cost"]').classList.contains("active")) {
+        fetchUsage();
+      }
+    });
+  });
 
   filterBtns.forEach(btn => {
     btn.addEventListener("click", () => {
@@ -932,13 +1190,6 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   runReplayBtn.addEventListener("click", () => runReplay());
-  [usageProviderFilter, usageModelFilter, usageSessionFilter].forEach(filter => {
-    filter.addEventListener("change", () => {
-      if (document.querySelector('[data-panel="cost"]').classList.contains("active")) {
-        switchTab("cost");
-      }
-    });
-  });
   if (runExperimentBtn) {
     runExperimentBtn.addEventListener("click", runExperiment);
   }
