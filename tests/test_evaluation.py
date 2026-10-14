@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_replay.api import create_app
@@ -149,6 +150,150 @@ def test_criteria_reject_unsupported_or_invalid_values():
     assert validate_criteria({"max_tokens": 0})["max_tokens"] == 0
 
 
+def test_deterministic_assertions_cover_values_membership_metrics_and_evidence():
+    tool = make_event({"items": ["a", "b"]}, seq=1)
+    model = make_event(
+        {"text": "The workflow worked"},
+        seq=2,
+        event_type="model_call",
+        tokens_in=2,
+        tokens_out=4,
+        tokens_total=6,
+        cost_usd=0.001,
+        cost_status="estimated",
+    )
+    result = evaluate_session(
+        "assertions",
+        [tool, model],
+        {
+            "assertions": [
+                {
+                    "name": "Expected output phrase",
+                    "source": "output",
+                    "path": "text",
+                    "operator": "contains",
+                    "expected": "worked",
+                },
+                {
+                    "name": "Recorded array length",
+                    "source": "event_result",
+                    "path": "items",
+                    "event_seq": 1,
+                    "operator": "length_eq",
+                    "expected": 2,
+                },
+                {
+                    "name": "No recorded error",
+                    "source": "event_error",
+                    "event_seq": 1,
+                    "operator": "not_exists",
+                },
+                {
+                    "name": "Minimum tokens",
+                    "source": "metric",
+                    "path": "total_tokens",
+                    "operator": "gte",
+                    "expected": 6,
+                },
+            ]
+        },
+    )
+
+    assertion_results = result["evaluators"]["assertions"]["results"]
+    assert result["evaluators"]["assertions"]["status"] == "passed"
+    assert all(assertion["status"] == "passed" for assertion in assertion_results)
+    assert assertion_results[0]["evidence"] == [
+        {"session_id": "assertions", "seq": 2, "type": "model_call", "name": "tool"}
+    ]
+
+
+def test_assertions_never_pass_on_missing_data_or_incompatible_json_types():
+    missing = evaluate_session(
+        "missing",
+        [make_event({"enabled": 1})],
+        {
+            "assertions": [
+                {
+                    "name": "Missing path",
+                    "source": "output",
+                    "path": "not_present",
+                    "operator": "exists",
+                },
+                {
+                    "name": "Boolean is not numeric",
+                    "source": "output",
+                    "path": "enabled",
+                    "operator": "eq",
+                    "expected": True,
+                },
+            ]
+        },
+    )
+
+    checks = missing["evaluators"]["assertions"]["results"]
+    assert checks[0]["status"] == "failed"
+    assert checks[1]["status"] == "failed"
+    assert missing["evaluators"]["assertions"]["status"] == "failed"
+
+    unavailable = evaluate_session(
+        "empty",
+        [],
+        {
+            "assertions": [
+                {
+                    "name": "Unavailable output",
+                    "source": "output",
+                    "path": "answer",
+                    "operator": "eq",
+                    "expected": "yes",
+                }
+            ]
+        },
+    )
+    assert unavailable["evaluators"]["assertions"]["status"] == "unavailable"
+
+
+def test_suite_evaluation_and_replay_history_survive_storage_reopen(tmp_path):
+    database_path = tmp_path / "phase3-history.sqlite"
+    storage = SQLiteStorage(db_path=database_path)
+    storage.create_session("persisted")
+    storage.save_event(
+        Event(
+            session_id="persisted",
+            seq=1,
+            type="tool_call",
+            name="lookup",
+            args_json="{}",
+            result_json='{"answer":"recorded"}',
+        )
+    )
+    client = TestClient(create_app(storage=storage))
+    suite = client.post(
+        "/api/evaluation-suites",
+        json={
+            "name": "Saved answer",
+            "criteria": {"expected_output": {"answer": "recorded"}},
+        },
+    ).json()
+    evaluation = client.post(
+        "/api/evaluations/sessions/persisted",
+        json={"suite_id": suite["suite_id"], "suite_version": suite["version"]},
+    )
+    validation = client.post("/api/sessions/persisted/replay-validations", json={})
+    assert evaluation.status_code == validation.status_code == 200
+
+    reloaded = SQLiteStorage(db_path=database_path)
+    assert reloaded.get_evaluation_suite(suite["suite_id"], 1) == suite
+    assert (
+        reloaded.list_evaluations(session_id="persisted")[0]["evaluation_id"]
+        == (evaluation.json()["evaluation_id"])
+    )
+    assert (
+        reloaded.list_replay_validations("persisted")[0]["validation_id"]
+        == (validation.json()["validation_id"])
+    )
+
+
 def test_api_persists_repeated_experiment_evaluations_and_compares_same_criteria():
     storage = SQLiteStorage(db_path=":memory:")
     experiment = run_counterfactual_experiment(storage)
@@ -285,3 +430,138 @@ def test_experiment_evaluation_uses_saved_event_snapshot_when_session_was_delete
     record = response.json()
     assert record["result"]["baseline"]["status"] == "failed"
     assert any("snapshot" in item for item in record["result"]["limitations"])
+
+
+def test_evaluation_suite_versions_are_immutable_and_reusable_for_experiments():
+    storage = SQLiteStorage(db_path=":memory:")
+    client = TestClient(create_app(storage=storage))
+    created = client.post(
+        "/api/evaluation-suites",
+        json={
+            "name": "Expected credit limit",
+            "description": "Check the recorded outcome",
+            "criteria": {
+                "assertions": [
+                    {
+                        "name": "credit limit",
+                        "source": "output",
+                        "path": "credit_limit",
+                        "operator": "eq",
+                        "expected": 1250,
+                    }
+                ]
+            },
+        },
+    )
+    assert created.status_code == 200
+    suite = created.json()
+
+    updated = client.put(
+        f"/api/evaluation-suites/{suite['suite_id']}",
+        json={
+            "current_version": 1,
+            "name": "Expected credit limit",
+            "description": "Require the recorded field",
+            "criteria": {"required_fields": ["credit_limit"]},
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["version"] == 2
+    assert (
+        client.get(f"/api/evaluation-suites/{suite['suite_id']}?version=1").json()["criteria"]
+        == suite["criteria"]
+    )
+    assert (
+        len(client.get(f"/api/evaluation-suites/{suite['suite_id']}/versions").json()["versions"])
+        == 2
+    )
+    assert (
+        client.put(
+            f"/api/evaluation-suites/{suite['suite_id']}",
+            json={
+                "current_version": 1,
+                "name": "Stale update",
+                "description": "",
+                "criteria": {},
+            },
+        ).status_code
+        == 409
+    )
+
+    experiment = run_counterfactual_experiment(storage)
+    evaluation = client.post(
+        f"/api/experiments/{experiment['experiment_id']}/evaluations",
+        json={"suite_id": suite["suite_id"], "suite_version": 1},
+    )
+    assert evaluation.status_code == 200, evaluation.text
+    record = evaluation.json()
+    assert record["suite_id"] == suite["suite_id"]
+    assert record["suite_version"] == 1
+    assert record["criteria"] == suite["criteria"]
+    assert (
+        record["result"]["comparison"]["criteria_statuses"]["assertion:assertion-1"]["fork"]
+        == "passed"
+    )
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        {"name": "bad source", "source": [], "path": "x", "operator": "eq", "expected": 1},
+        {"name": "bad operator", "source": "output", "path": "x", "operator": {}, "expected": 1},
+    ],
+)
+def test_malformed_assertions_return_validation_errors(assertion):
+    storage = SQLiteStorage(db_path=":memory:")
+    client = TestClient(create_app(storage=storage))
+    response = client.post(
+        "/api/evaluation-suites",
+        json={
+            "name": "Invalid",
+            "description": "",
+            "criteria": {"assertions": [assertion]},
+        },
+    )
+    assert response.status_code == 422
+    assert "assertions[0]" in response.json()["detail"]
+
+
+def test_standalone_strict_replay_validation_persists_attempts_and_empty_calls():
+    storage = SQLiteStorage(db_path=":memory:")
+    storage.create_session("strict-check")
+    storage.save_event(
+        Event(
+            session_id="strict-check",
+            seq=1,
+            type="tool_call",
+            name="lookup",
+            args_json='{"id":1}',
+            result_json='{"value":"recorded"}',
+        )
+    )
+    client = TestClient(create_app(storage=storage))
+    endpoint = "/api/sessions/strict-check/replay-validations"
+
+    complete = client.post(endpoint, json={})
+    incomplete = client.post(endpoint, json={"calls": []})
+    diverged = client.post(
+        endpoint,
+        json={"calls": [{"type": "tool_call", "name": "other", "args": {"id": 1}}]},
+    )
+
+    assert complete.status_code == 200
+    assert complete.json()["status"] == "passed"
+    assert complete.json()["result"]["events"][0]["status"] == "matched"
+    assert incomplete.status_code == 200
+    assert incomplete.json()["status"] == "partial"
+    assert incomplete.json()["result"]["events"][0]["status"] == "not_checked"
+    assert diverged.status_code == 200
+    assert diverged.json()["status"] == "failed"
+    history = client.get(endpoint)
+    assert history.status_code == 200
+    assert len(history.json()["validations"]) == 3
+    assert {record["validation_id"] for record in history.json()["validations"]} == {
+        complete.json()["validation_id"],
+        incomplete.json()["validation_id"],
+        diverged.json()["validation_id"],
+    }

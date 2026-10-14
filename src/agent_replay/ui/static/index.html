@@ -152,6 +152,10 @@
               <select id="playground-evaluation-session" class="select-input"></select>
             </label>
             <label class="control-group">
+              <span class="metric-label">Reusable suite (optional)</span>
+              <select id="playground-evaluation-suite" class="select-input"></select>
+            </label>
+            <label class="control-group">
               <span class="metric-label">Deterministic criteria (JSON)</span>
               <textarea id="playground-evaluation-criteria" class="prompt-input" rows="3">{"required_fields":["text"]}</textarea>
             </label>
@@ -161,7 +165,27 @@
             </div>
             <h3 class="section-heading">Session evaluation history</h3>
             <div id="playground-evaluation-history" class="experiment-history"><p class="text-muted">Select a session to view saved evaluations.</p></div>
-          </div>
+            <div class="suite-library">
+              <h3 class="section-heading">Reusable evaluation suites</h3>
+              <p class="text-muted">Suites are versioned. Editing creates a new version; prior results keep their original criteria snapshot.</p>
+              <label class="control-group">
+                <span class="metric-label">Starting template</span>
+                <select id="suite-template-select" class="select-input"></select>
+              </label>
+              <label class="control-group">
+                <span class="metric-label">Suite to edit or inspect</span>
+                <select id="suite-edit-select" class="select-input"></select>
+              </label>
+              <input id="suite-name-input" class="text-input" maxlength="100" placeholder="Suite name">
+              <input id="suite-description-input" class="text-input" maxlength="500" placeholder="Optional description">
+              <label class="control-group">
+                <span class="metric-label">Criteria JSON</span>
+                <textarea id="suite-criteria-input" class="prompt-input" rows="7">{"expected_output":{"answer":"expected value"}}</textarea>
+              </label>
+              <button id="save-suite-btn" class="btn btn-primary" type="button">Create suite</button>
+              <p id="suite-library-status" class="text-muted" aria-live="polite"></p>
+              <div id="suite-library-history" class="experiment-history"></div>
+            </div>
           <form id="playground-form" class="playground-form">
             <select id="playground-provider" class="select-input" aria-label="Provider"></select>
             <input id="playground-model" class="text-input" placeholder="Model (optional)">
@@ -180,7 +204,7 @@
               <select id="replay-session-select" class="select-input"></select>
             </label>
             <label class="control-group">
-              <span class="metric-label">Mode</span>
+              <span class="metric-label">Mode (Strict validates the trace; it does not rerun an agent)</span>
               <select id="replay-mode-select" class="select-input">
                 <option value="strict">Strict</option>
                 <option value="forked">Forked</option>
@@ -191,6 +215,8 @@
           <div id="replay-results" class="replay-results">
             <p class="text-muted">Select a session and run replay to inspect each event.</p>
           </div>
+          <h3 class="section-heading">Strict replay validation history</h3>
+          <div id="replay-validation-history" class="experiment-history"><p class="text-muted">Select a session to view validation attempts.</p></div>
         </div>
       </section>
 
@@ -214,6 +240,10 @@
             <label class="control-group experiment-result-input">
               <span class="metric-label">Replacement tool response (JSON)</span>
               <textarea id="experiment-result-input" class="prompt-input" rows="4">{"status":"ok","balance":500.0}</textarea>
+            </label>
+            <label class="control-group experiment-result-input">
+              <span class="metric-label">Reusable evaluation suite (optional)</span>
+              <select id="experiment-suite-select" class="select-input"></select>
             </label>
             <button id="run-experiment-btn" class="btn btn-primary">Run comparison</button>
           </div>

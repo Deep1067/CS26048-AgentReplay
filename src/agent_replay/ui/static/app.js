@@ -2,6 +2,11 @@ document.addEventListener("DOMContentLoaded", () => {
   let allSessions = [];
   let currentSessionData = null;
   let currentExperimentId = null;
+  let currentEvaluationSuite = null;
+  let evaluationSuites = [];
+  let latestEvaluationSuites = [];
+  let loadExperimentEvaluations = null;
+  let loadSessionEvaluationHistory = null;
   let currentFilter = "all";
   let liveMonitorTimer = null;
   let liveExecutionEnabled = false;
@@ -31,6 +36,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const replayModeSelect = document.getElementById("replay-mode-select");
   const runReplayBtn = document.getElementById("run-replay-btn");
   const replayResultsEl = document.getElementById("replay-results");
+  const replayValidationHistoryEl = document.getElementById("replay-validation-history");
   const runExperimentBtn = document.getElementById("run-experiment-btn");
   const experimentResultsEl = document.getElementById("experiment-results");
   const experimentBaselineSelect = document.getElementById("experiment-baseline-select");
@@ -76,6 +82,16 @@ document.addEventListener("DOMContentLoaded", () => {
   const evaluateRecordedSessionBtn = document.getElementById("evaluate-recorded-session-btn");
   const playgroundEvaluationResults = document.getElementById("playground-evaluation-results");
   const playgroundEvaluationHistory = document.getElementById("playground-evaluation-history");
+  const playgroundEvaluationSuite = document.getElementById("playground-evaluation-suite");
+  const experimentSuiteSelect = document.getElementById("experiment-suite-select");
+  const suiteTemplateSelect = document.getElementById("suite-template-select");
+  const suiteEditSelect = document.getElementById("suite-edit-select");
+  const suiteNameInput = document.getElementById("suite-name-input");
+  const suiteDescriptionInput = document.getElementById("suite-description-input");
+  const suiteCriteriaInput = document.getElementById("suite-criteria-input");
+  const saveSuiteBtn = document.getElementById("save-suite-btn");
+  const suiteLibraryStatus = document.getElementById("suite-library-status");
+  const suiteLibraryHistory = document.getElementById("suite-library-history");
   const usageProviderFilter = document.getElementById("usage-provider-filter");
   const usageModelFilter = document.getElementById("usage-model-filter");
   const usageSessionFilter = document.getElementById("usage-session-filter");
@@ -133,6 +149,12 @@ document.addEventListener("DOMContentLoaded", () => {
       mobileNavToggle.setAttribute("aria-label", "Open navigation");
     }
 
+    function addListenerOnce(element, key, eventName, listener) {
+      if (element.dataset[key] === "true") return;
+      element.dataset[key] = "true";
+      element.addEventListener(eventName, listener);
+    }
+
     function parseEvaluationCriteria(input) {
       let criteria;
       try {
@@ -146,11 +168,293 @@ document.addEventListener("DOMContentLoaded", () => {
       return criteria;
     }
 
+    function setSuiteOptions(select, suites) {
+      const selected = select.value;
+      select.replaceChildren();
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "Use criteria editor instead";
+      select.appendChild(empty);
+      suites.forEach(suite => {
+        const option = document.createElement("option");
+        option.value = `${suite.suite_id}|${suite.version}`;
+        option.textContent = `${suite.name} · v${suite.version}`;
+        select.appendChild(option);
+      });
+      if ([...select.options].some(option => option.value === selected)) {
+        select.value = selected;
+      }
+    }
+
+    async function fetchEvaluationSuites() {
+      try {
+        const [suitesResponse, templatesResponse] = await Promise.all([
+          fetch("/api/evaluation-suites"),
+          fetch("/api/evaluation-suites/templates"),
+        ]);
+        const suitesData = await suitesResponse.json();
+        const templatesData = await templatesResponse.json();
+        if (!suitesResponse.ok) throw new Error(suitesData.detail || "Unable to load suites.");
+        if (!templatesResponse.ok) throw new Error(templatesData.detail || "Unable to load templates.");
+        latestEvaluationSuites = suitesData.suites;
+        const versionLists = await Promise.all(
+          latestEvaluationSuites.map(async suite => {
+            const response = await fetch(
+              `/api/evaluation-suites/${encodeURIComponent(suite.suite_id)}/versions`
+            );
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.detail || "Unable to load suite versions.");
+            return data.versions;
+          })
+        );
+        evaluationSuites = versionLists.flat();
+        setSuiteOptions(playgroundEvaluationSuite, evaluationSuites);
+        setSuiteOptions(experimentSuiteSelect, evaluationSuites);
+        const selectedSuiteId = suiteEditSelect.value;
+        suiteEditSelect.replaceChildren();
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = "Create a new suite";
+        suiteEditSelect.appendChild(empty);
+        latestEvaluationSuites.forEach(suite => {
+          const option = document.createElement("option");
+          option.value = suite.suite_id;
+          option.textContent = `${suite.name} · v${suite.version}`;
+          suiteEditSelect.appendChild(option);
+        });
+        if ([...suiteEditSelect.options].some(option => option.value === selectedSuiteId)) {
+          suiteEditSelect.value = selectedSuiteId;
+        }
+        suiteTemplateSelect.replaceChildren();
+        const templatePlaceholder = document.createElement("option");
+        templatePlaceholder.value = "";
+        templatePlaceholder.textContent = "Choose a template";
+        suiteTemplateSelect.appendChild(templatePlaceholder);
+        templatesData.templates.forEach(template => {
+          const option = document.createElement("option");
+          option.value = template.id;
+          option.textContent = template.name;
+          suiteTemplateSelect.appendChild(option);
+        });
+      } catch (err) {
+        suiteLibraryStatus.textContent = `Unable to load evaluation suites: ${err.message}`;
+      }
+    }
+
+    function populateSuiteForm(suite) {
+      currentEvaluationSuite = suite;
+      suiteNameInput.value = suite?.name || "";
+      suiteDescriptionInput.value = suite?.description || "";
+      suiteCriteriaInput.value = JSON.stringify(
+        suite?.criteria || { expected_output: { answer: "expected value" } },
+        null,
+        2
+      );
+      saveSuiteBtn.textContent = suite ? `Save as version ${suite.version + 1}` : "Create suite";
+    }
+
+    addListenerOnce(suiteTemplateSelect, "templateListener", "change", async () => {
+      if (!suiteTemplateSelect.value) return;
+      try {
+        const response = await fetch("/api/evaluation-suites/templates");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Unable to load templates.");
+        const template = data.templates.find(item => item.id === suiteTemplateSelect.value);
+        if (!template) throw new Error("The selected template is no longer available.");
+        suiteEditSelect.value = "";
+        populateSuiteForm({
+          name: template.name,
+          description: template.description,
+          criteria: template.criteria,
+        });
+        currentEvaluationSuite = null;
+        saveSuiteBtn.textContent = "Create suite from template";
+        suiteLibraryHistory.replaceChildren();
+      } catch (err) {
+        suiteLibraryStatus.textContent = err.message;
+      }
+    });
+
+    addListenerOnce(suiteEditSelect, "editListener", "change", async () => {
+      if (!suiteEditSelect.value) {
+        populateSuiteForm(null);
+        suiteLibraryHistory.textContent = "Select a saved suite or choose a template.";
+        return;
+      }
+      try {
+        const response = await fetch(
+          `/api/evaluation-suites/${encodeURIComponent(suiteEditSelect.value)}`
+        );
+        const suite = await response.json();
+        if (!response.ok) throw new Error(suite.detail || "Unable to load suite.");
+        populateSuiteForm(suite);
+        await fetchEvaluationSuiteVersions(suite.suite_id, suite.version);
+      } catch (err) {
+        suiteLibraryStatus.textContent = err.message;
+      }
+    });
+
+    async function fetchEvaluationSuiteVersions(suiteId, latestVersion) {
+      try {
+        const response = await fetch(
+          `/api/evaluation-suites/${encodeURIComponent(suiteId)}/versions`
+        );
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Unable to load suite versions.");
+        suiteLibraryHistory.replaceChildren();
+        data.versions.forEach(suite => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "overview-session";
+          button.textContent = `${suite.name} · version ${suite.version}${suite.version === latestVersion ? " (current)" : " (history)"}`;
+          button.addEventListener("click", () => populateSuiteForm(suite));
+          suiteLibraryHistory.appendChild(button);
+        });
+      } catch (err) {
+        suiteLibraryHistory.textContent = `Unable to load suite versions: ${err.message}`;
+      }
+    }
+
+    addListenerOnce(saveSuiteBtn, "saveListener", "click", async () => {
+      let criteria;
+      try {
+        criteria = parseEvaluationCriteria(suiteCriteriaInput);
+      } catch (err) {
+        suiteLibraryStatus.textContent = err.message;
+        return;
+      }
+      const body = {
+        name: suiteNameInput.value,
+        description: suiteDescriptionInput.value,
+        criteria,
+      };
+      const editing = currentEvaluationSuite?.suite_id;
+      if (
+        editing &&
+        latestEvaluationSuites.find(item => item.suite_id === editing)?.version !== currentEvaluationSuite.version
+      ) {
+        suiteLibraryStatus.textContent =
+          "Historical suite versions are read-only. Select the current version before editing.";
+        return;
+      }
+      if (editing) body.current_version = currentEvaluationSuite.version;
+      saveSuiteBtn.disabled = true;
+      try {
+        const response = await fetch(
+          editing
+            ? `/api/evaluation-suites/${encodeURIComponent(editing)}`
+            : "/api/evaluation-suites",
+          {
+            method: editing ? "PUT" : "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }
+        );
+        const suite = await response.json();
+        if (!response.ok) throw new Error(suite.detail || "Unable to save suite.");
+        await fetchEvaluationSuites();
+        suiteEditSelect.value = suite.suite_id;
+        populateSuiteForm(suite);
+        await fetchEvaluationSuiteVersions(suite.suite_id, suite.version);
+        suiteLibraryStatus.textContent = `Saved ${suite.name} version ${suite.version}.`;
+      } catch (err) {
+        suiteLibraryStatus.textContent = `Unable to save suite: ${err.message}`;
+      } finally {
+        saveSuiteBtn.disabled = false;
+      }
+    });
+
+    function selectedSuite(select) {
+      if (!select.value) return null;
+      const [suiteId, rawVersion] = select.value.split("|");
+      const version = Number(rawVersion);
+      return evaluationSuites.find(
+        suite => suite.suite_id === suiteId && suite.version === version
+      ) || null;
+    }
+
+    addListenerOnce(playgroundEvaluationSuite, "suiteListener", "change", () => {
+      const suite = selectedSuite(playgroundEvaluationSuite);
+      playgroundEvaluationCriteria.readOnly = Boolean(suite);
+      if (suite) playgroundEvaluationCriteria.value = JSON.stringify(suite.criteria, null, 2);
+    });
+
+    addListenerOnce(experimentSuiteSelect, "suiteListener", "change", () => {
+      const suite = selectedSuite(experimentSuiteSelect);
+      experimentEvaluationCriteria.readOnly = Boolean(suite);
+      if (suite) experimentEvaluationCriteria.value = JSON.stringify(suite.criteria, null, 2);
+    });
+
     function renderEvaluation(container, record) {
+      const result = record.result || {};
+      const heading = document.createElement("h3");
+      heading.className = "section-heading";
+      heading.textContent = `Evaluation ${record.evaluation_id || ""} · ${result.status || "unknown"}`;
+      const metadata = document.createElement("p");
+      metadata.className = "text-muted";
+      metadata.textContent = [
+        `Recorded ${record.evaluated_at || result.evaluated_at || "time unavailable"}`,
+        record.suite_id ? `Suite ${record.suite_id} version ${record.suite_version}` : "Inline criteria",
+        "Deterministic evaluation of recorded evidence; not a guarantee of correctness.",
+      ].join(" · ");
+      const content = document.createElement("div");
+      if (result.baseline && result.fork) {
+        const comparison = document.createElement("p");
+        comparison.textContent =
+          `Baseline: ${result.baseline.status}; fork: ${result.fork.status}. ` +
+          "Replay validity is reported separately from these quality results.";
+        content.appendChild(comparison);
+        const table = document.createElement("table");
+        table.className = "pricing-table";
+        const head = document.createElement("thead");
+        const headerRow = document.createElement("tr");
+        ["Check", "Baseline", "Fork"].forEach(label => {
+          const cell = document.createElement("th");
+          cell.textContent = label;
+          headerRow.appendChild(cell);
+        });
+        head.appendChild(headerRow);
+        const body = document.createElement("tbody");
+        Object.entries(result.comparison?.criteria_statuses || {}).forEach(([name, statuses]) => {
+          const row = document.createElement("tr");
+          [name, statuses.baseline, statuses.fork].forEach(value => {
+            const cell = document.createElement("td");
+            cell.textContent = value || "unavailable";
+            row.appendChild(cell);
+          });
+          body.appendChild(row);
+        });
+        table.append(head, body);
+        content.appendChild(table);
+        if (result.comparison) {
+          const changes = document.createElement("p");
+          changes.textContent =
+            `Improvements: ${(result.comparison.improvements || []).join(", ") || "none"}; ` +
+            `regressions: ${(result.comparison.regressions || []).join(", ") || "none"}; ` +
+            `unchanged: ${(result.comparison.unchanged || []).join(", ") || "none"}; ` +
+            `not comparable: ${(result.comparison.not_comparable || []).join(", ") || "none"}.`;
+          content.appendChild(changes);
+        }
+      } else {
+        const status = document.createElement("p");
+        status.textContent = result.status_explanation || result.explanation || "No evaluation explanation is available.";
+        content.appendChild(status);
+        const evaluators = document.createElement("ul");
+        Object.entries(result.evaluators || {}).forEach(([name, evaluator]) => {
+          const item = document.createElement("li");
+          item.textContent = `${evaluator.name || name}: ${evaluator.status} — ${evaluator.explanation}`;
+          evaluators.appendChild(item);
+        });
+        content.appendChild(evaluators);
+      }
+      const evidence = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "Criteria, evidence, and full evaluation record";
       const output = document.createElement("pre");
       output.className = "code-block";
       output.textContent = JSON.stringify(record, null, 2);
-      container.replaceChildren(output);
+      evidence.append(summary, output);
+      container.replaceChildren(heading, metadata, content, evidence);
     }
 
     async function fetchExperimentEvaluations(experimentId) {
@@ -169,9 +473,14 @@ document.addEventListener("DOMContentLoaded", () => {
           const button = document.createElement("button");
           button.type = "button";
           button.className = "overview-session";
-          button.textContent = `${record.evaluated_at} · ${record.result.status}`;
-          button.addEventListener("click", () => {
+          button.textContent = `${record.evaluated_at} · ${record.result.status}${record.suite_id ? ` · ${record.suite_id} v${record.suite_version}` : ""}`;
+          button.addEventListener("click", async () => {
+            if (record.suite_id) await fetchEvaluationSuites();
             experimentEvaluationCriteria.value = JSON.stringify(record.criteria, null, 2);
+            experimentSuiteSelect.value = record.suite_id
+              ? `${record.suite_id}|${record.suite_version}`
+              : "";
+            experimentEvaluationCriteria.readOnly = Boolean(record.suite_id);
             renderEvaluation(experimentEvaluationResults, record);
           });
           experimentEvaluationHistory.appendChild(button);
@@ -181,18 +490,23 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
 
-    evaluateExperimentBtn.addEventListener("click", async () => {
+    loadExperimentEvaluations = fetchExperimentEvaluations;
+
+    addListenerOnce(evaluateExperimentBtn, "evaluateListener", "click", async () => {
       if (!currentExperimentId) return;
       evaluateExperimentBtn.disabled = true;
       try {
-        const criteria = parseEvaluationCriteria(experimentEvaluationCriteria);
+        const suite = selectedSuite(experimentSuiteSelect);
+        const evaluation = suite
+          ? { suite_id: suite.suite_id, suite_version: suite.version }
+          : { criteria: parseEvaluationCriteria(experimentEvaluationCriteria) };
         experimentEvaluationResults.textContent = "Evaluating the recorded baseline and fork...";
         const response = await fetch(
           `/api/experiments/${encodeURIComponent(currentExperimentId)}/evaluations`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ criteria }),
+            body: JSON.stringify(evaluation),
           }
         );
         const record = await response.json();
@@ -206,7 +520,7 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     });
 
-    evaluateRecordedSessionBtn.addEventListener("click", async () => {
+    addListenerOnce(evaluateRecordedSessionBtn, "evaluateListener", "click", async () => {
       const sessionId = playgroundEvaluationSession.value;
       if (!sessionId) {
         playgroundEvaluationResults.textContent = "Select a recorded session to evaluate.";
@@ -214,14 +528,17 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       evaluateRecordedSessionBtn.disabled = true;
       try {
-        const criteria = parseEvaluationCriteria(playgroundEvaluationCriteria);
+        const suite = selectedSuite(playgroundEvaluationSuite);
+        const evaluation = suite
+          ? { suite_id: suite.suite_id, suite_version: suite.version }
+          : { criteria: parseEvaluationCriteria(playgroundEvaluationCriteria) };
         playgroundEvaluationResults.textContent = "Evaluating the recorded output; no provider call will be made...";
         const response = await fetch(
           `/api/evaluations/sessions/${encodeURIComponent(sessionId)}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ criteria }),
+            body: JSON.stringify(evaluation),
           }
         );
         const record = await response.json();
@@ -255,9 +572,14 @@ document.addEventListener("DOMContentLoaded", () => {
           const button = document.createElement("button");
           button.type = "button";
           button.className = "overview-session";
-          button.textContent = `${record.evaluated_at} · ${record.result.status}`;
-          button.addEventListener("click", () => {
+          button.textContent = `${record.evaluated_at} · ${record.result.status}${record.suite_id ? ` · ${record.suite_id} v${record.suite_version}` : ""}`;
+          button.addEventListener("click", async () => {
+            if (record.suite_id) await fetchEvaluationSuites();
             playgroundEvaluationCriteria.value = JSON.stringify(record.criteria, null, 2);
+            playgroundEvaluationSuite.value = record.suite_id
+              ? `${record.suite_id}|${record.suite_version}`
+              : "";
+            playgroundEvaluationCriteria.readOnly = Boolean(record.suite_id);
             renderEvaluation(playgroundEvaluationResults, record);
           });
           playgroundEvaluationHistory.appendChild(button);
@@ -267,12 +589,16 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
 
-    playgroundEvaluationSession.addEventListener("change", () => {
+    loadSessionEvaluationHistory = fetchSessionEvaluationHistory;
+
+    addListenerOnce(playgroundEvaluationSession, "historyListener", "change", () => {
       fetchSessionEvaluationHistory(playgroundEvaluationSession.value);
     });
     if (tabName === "overview") fetchOverview();
     if (tabName === "playground") fetchProviders();
+    if (tabName === "playground") fetchEvaluationSuites();
     if (tabName === "experiment") {
+      fetchEvaluationSuites();
       fetchExperimentBaselines();
       fetchExperimentHistory();
     }
@@ -457,7 +783,7 @@ document.addEventListener("DOMContentLoaded", () => {
           playgroundEvaluationSession.appendChild(option);
         }
         playgroundEvaluationSession.value = data.session_id;
-        fetchSessionEvaluationHistory(data.session_id);
+        if (loadSessionEvaluationHistory) loadSessionEvaluationHistory(data.session_id);
         playgroundPrompt.value = "";
       } catch (err) {
         providerNotice.textContent = err.message;
@@ -661,6 +987,67 @@ document.addEventListener("DOMContentLoaded", () => {
     if (currentSessionData) {
       replaySessionSelect.value = currentSessionData.session_id;
     }
+    fetchReplayValidationHistory(replaySessionSelect.value);
+  }
+
+  async function fetchReplayValidationHistory(sessionId) {
+    replayValidationHistoryEl.replaceChildren();
+    if (!sessionId) {
+      replayValidationHistoryEl.textContent = "Select a session to view validation attempts.";
+      return;
+    }
+    try {
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/replay-validations`
+      );
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Unable to load replay validation history.");
+      if (!data.validations.length) {
+        replayValidationHistoryEl.textContent = "No strict replay validations have been recorded.";
+        return;
+      }
+      data.validations.forEach(validation => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "overview-session";
+        button.textContent = `${validation.validated_at} · ${validation.status}`;
+        button.addEventListener("click", () => renderStrictReplayValidation(validation));
+        replayValidationHistoryEl.appendChild(button);
+      });
+    } catch (err) {
+      replayValidationHistoryEl.textContent = `Unable to load replay validation history: ${err.message}`;
+    }
+  }
+
+  function renderStrictReplayValidation(validation) {
+    const output = document.createElement("pre");
+    output.className = "code-block";
+    output.textContent = JSON.stringify(validation, null, 2);
+    replayResultsEl.replaceChildren(output);
+  }
+
+  async function runStrictReplayValidation() {
+    const sessionId = replaySessionSelect.value;
+    if (!sessionId) {
+      replayResultsEl.textContent = "Select a session before validating strict replay.";
+      return;
+    }
+    runReplayBtn.disabled = true;
+    replayResultsEl.textContent = "Validating the recorded trace; no agent will be executed...";
+    try {
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/replay-validations`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      );
+      const validation = await response.json();
+      if (!response.ok) throw new Error(validation.detail || "Strict replay validation failed.");
+      renderStrictReplayValidation(validation);
+      await fetchReplayValidationHistory(sessionId);
+    } catch (err) {
+      replayResultsEl.textContent = `Strict replay validation failed: ${err.message}`;
+    } finally {
+      runReplayBtn.disabled = false;
+    }
   }
 
   function displayValue(value) {
@@ -719,6 +1106,10 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   async function runReplay(options = {}) {
+    if (!options.substituteSeq && replayModeSelect.value === "strict") {
+      await runStrictReplayValidation();
+      return;
+    }
     const body = {
       session_id: replaySessionSelect.value,
       mode: replayModeSelect.value,
@@ -779,7 +1170,7 @@ document.addEventListener("DOMContentLoaded", () => {
       ),
     ].join("\n");
     experimentResultsEl.appendChild(summary);
-    fetchExperimentEvaluations(data.experiment_id);
+    if (loadExperimentEvaluations) loadExperimentEvaluations(data.experiment_id);
 
     [data.parent_session_id, data.fork_session_id].forEach(sessionId => {
       const button = document.createElement("button");
@@ -993,9 +1384,10 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!res.ok) throw new Error("Failed to load session details");
       currentSessionData = await res.json();
       replaySessionSelect.value = sessionId;
+      fetchReplayValidationHistory(sessionId);
       if ([...playgroundEvaluationSession.options].some(option => option.value === sessionId)) {
         playgroundEvaluationSession.value = sessionId;
-        fetchSessionEvaluationHistory(sessionId);
+        if (loadSessionEvaluationHistory) loadSessionEvaluationHistory(sessionId);
       }
       sessionContext.textContent = `Session: ${sessionId}`;
       sessionContext.disabled = false;
@@ -1374,6 +1766,9 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   runReplayBtn.addEventListener("click", () => runReplay());
+  replaySessionSelect.addEventListener("change", () => {
+    fetchReplayValidationHistory(replaySessionSelect.value);
+  });
   if (runExperimentBtn) {
     runExperimentBtn.addEventListener("click", runExperiment);
   }

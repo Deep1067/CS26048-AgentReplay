@@ -189,6 +189,53 @@ measurements do not score answer quality: summed event durations are not wall-cl
 and configured-rate costs are estimates, not provider-confirmed billing. No weighted aggregate
 score is calculated.
 
+### Reusable evaluation suites and strict replay history
+
+Evaluation suites can be created from the built-in templates, updated as immutable versions, and
+applied to a session or both sessions in a guided experiment. Evaluation records retain the
+criteria snapshot plus the selected suite ID/version, so later suite edits do not change prior
+results. The API supports `GET /api/evaluation-suites/templates`, `GET` and `POST
+/api/evaluation-suites`, `GET /api/evaluation-suites/{suite_id}`, `GET
+/api/evaluation-suites/{suite_id}/versions`, and `PUT /api/evaluation-suites/{suite_id}`. Suite
+updates require `current_version`; stale edits receive HTTP 409.
+
+The `assertions` criteria array supports deterministic checks against recorded output, a selected
+event result/error, or a recorded aggregate metric. For example:
+
+```json
+{
+  "assertions": [
+    {
+      "name": "Credit limit is expected",
+      "source": "output",
+      "path": "credit_limit",
+      "operator": "eq",
+      "expected": 1250
+    },
+    {
+      "name": "The first event returned an account",
+      "source": "event_result",
+      "event_seq": 1,
+      "path": "status",
+      "operator": "eq",
+      "expected": "ok"
+    }
+  ]
+}
+```
+
+Supported sources are `output`, `event_result`, `event_error`, and `metric`. Supported operators
+include equality/inequality, numeric comparisons and ranges, string containment, array/object
+membership, length checks, and existence checks. Missing trace values are unavailable (except for
+explicit `exists`/`not_exists` checks); incompatible types do not coerce into a pass. Metrics are
+limited to `latency_ms`, `total_tokens`, and `cost_usd`.
+
+`POST /api/sessions/{session_id}/replay-validations` separately runs strict replay against the
+recorded call sequence and appends the attempt. `GET
+/api/sessions/{session_id}/replay-validations` returns its history. This validates recorded calls
+and reuses recorded results; it does not rerun an agent. Results distinguish complete matches,
+divergence, incomplete traces, and unavailable traces.
+
 ---
 
 ## 🌐 Interactive Timeline Web UI

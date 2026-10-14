@@ -48,3 +48,20 @@ def test_experiment_and_playground_have_recorded_output_evaluation_controls():
     assert "/api/experiments/${encodeURIComponent(currentExperimentId)}/evaluations" in source
     assert "/api/evaluations/sessions/${encodeURIComponent(sessionId)}" in source
     assert "output_source" in source
+
+
+def test_replay_history_and_versioned_suite_selectors_are_connected():
+    html = APP_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="replay-validation-history"' in html
+    assert "/api/sessions/${encodeURIComponent(sessionId)}/replay-validations" in source
+    assert 'fetch("/api/evaluation-suites")' in source
+    assert "/api/evaluation-suites/${encodeURIComponent(suite.suite_id)}/versions" in source
+    assert "suite_id: suite.suite_id, suite_version: suite.version" in source
+    assert "record.suite_id" in source
+    assert "No strict replay validations have been recorded." in source
+    assert "loadExperimentEvaluations = fetchExperimentEvaluations" in source
+    assert "loadExperimentEvaluations(data.experiment_id)" in source
+    assert "loadSessionEvaluationHistory(sessionId)" in source
+    assert "not comparable:" in source

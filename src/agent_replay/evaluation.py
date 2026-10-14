@@ -16,7 +16,131 @@ _SUPPORTED_CRITERIA = {
     "max_latency_ms",
     "max_tokens",
     "max_cost_usd",
+    "assertions",
 }
+_ASSERTION_SOURCES = {"output", "event_result", "event_error", "metric"}
+_ASSERTION_OPERATORS = {
+    "eq",
+    "ne",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "between",
+    "contains",
+    "not_contains",
+    "length_eq",
+    "length_gt",
+    "length_lt",
+    "includes",
+    "not_includes",
+    "exists",
+    "not_exists",
+}
+_METRIC_PATHS = {"latency_ms", "total_tokens", "cost_usd"}
+
+
+def _validate_assertion(assertion: Any, index: int) -> dict[str, Any]:
+    if not isinstance(assertion, dict):
+        raise ValueError(f"assertions[{index}] must be a JSON object.")
+    allowed = {
+        "id",
+        "name",
+        "source",
+        "path",
+        "operator",
+        "expected",
+        "event_seq",
+        "event_type",
+        "event_name",
+    }
+    unknown = set(assertion) - allowed
+    if unknown:
+        raise ValueError(
+            f"assertions[{index}] has unsupported fields: {', '.join(sorted(unknown))}."
+        )
+    name = assertion.get("name")
+    source = assertion.get("source")
+    operator = assertion.get("operator")
+    path = assertion.get("path")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"assertions[{index}].name must be a non-empty string.")
+    if not isinstance(source, str) or source not in _ASSERTION_SOURCES:
+        raise ValueError(f"assertions[{index}].source must be one of {sorted(_ASSERTION_SOURCES)}.")
+    if not isinstance(operator, str) or operator not in _ASSERTION_OPERATORS:
+        raise ValueError(
+            f"assertions[{index}].operator must be one of {sorted(_ASSERTION_OPERATORS)}."
+        )
+    if source == "event_error" and path is not None:
+        raise ValueError(f"assertions[{index}] event_error source does not use a path.")
+    if source not in {"event_result", "event_error"} and any(
+        assertion.get(key) is not None for key in ("event_seq", "event_type", "event_name")
+    ):
+        raise ValueError(
+            f"assertions[{index}] event selectors are only supported for event sources."
+        )
+    if source != "event_error" and (not isinstance(path, str) or not path.strip()):
+        raise ValueError(f"assertions[{index}].path must be a non-empty string.")
+    if source == "metric" and path not in _METRIC_PATHS:
+        raise ValueError(
+            f"assertions[{index}].path for metric must be one of {sorted(_METRIC_PATHS)}."
+        )
+    if source in {"event_result", "event_error"} and "event_seq" not in assertion:
+        raise ValueError(f"assertions[{index}] {source} currently requires event_seq.")
+    event_seq = assertion.get("event_seq")
+    if event_seq is not None and (
+        isinstance(event_seq, bool) or not isinstance(event_seq, int) or event_seq < 1
+    ):
+        raise ValueError(f"assertions[{index}].event_seq must be a positive integer.")
+    for field in ("event_type", "event_name", "id"):
+        value = assertion.get(field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"assertions[{index}].{field} must be a non-empty string.")
+    expected = assertion.get("expected")
+    if operator not in {"exists", "not_exists"} and "expected" not in assertion:
+        raise ValueError(f"assertions[{index}].expected is required for operator '{operator}'.")
+    if operator == "between" and (
+        not isinstance(expected, list)
+        or len(expected) != 2
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in expected)
+        or any(not math.isfinite(item) for item in expected)
+        or expected[0] > expected[1]
+    ):
+        raise ValueError(f"assertions[{index}].expected for between must be [minimum, maximum].")
+    if operator in {"gt", "gte", "lt", "lte"} and (
+        isinstance(expected, bool)
+        or not isinstance(expected, (int, float))
+        or not math.isfinite(expected)
+    ):
+        raise ValueError(f"assertions[{index}].expected for {operator} must be a number.")
+    if operator in {"length_eq", "length_gt", "length_lt"} and (
+        isinstance(expected, bool) or not isinstance(expected, int) or expected < 0
+    ):
+        raise ValueError(
+            f"assertions[{index}].expected for {operator} must be a non-negative integer."
+        )
+    if source == "event_error" and operator not in {
+        "eq",
+        "ne",
+        "contains",
+        "not_contains",
+        "exists",
+        "not_exists",
+    }:
+        raise ValueError(f"assertions[{index}] uses an unsupported operator for event_error.")
+    if operator in {"contains", "not_contains"} and not isinstance(expected, str):
+        raise ValueError(f"assertions[{index}].expected for {operator} must be a string.")
+    return {
+        "id": assertion.get("id") or f"assertion-{index + 1}",
+        "name": name.strip(),
+        "source": source,
+        "path": path,
+        "operator": operator,
+        **({"expected": expected} if "expected" in assertion else {}),
+        "event_seq": event_seq,
+        "event_type": assertion.get("event_type"),
+        "event_name": assertion.get("event_name"),
+    }
 
 
 def validate_criteria(criteria: Any) -> dict[str, Any]:
@@ -50,6 +174,15 @@ def validate_criteria(criteria: Any) -> dict[str, Any]:
             or value < 0
         ):
             raise ValueError(f"{name} must be a finite non-negative number.")
+    assertions = criteria.get("assertions", [])
+    if not isinstance(assertions, list):
+        raise ValueError("assertions must be a list.")
+    normalized_assertions = [
+        _validate_assertion(assertion, index) for index, assertion in enumerate(assertions)
+    ]
+    assertion_ids = [assertion["id"] for assertion in normalized_assertions]
+    if len(set(assertion_ids)) != len(assertion_ids):
+        raise ValueError("Assertion ids must be unique within a suite.")
 
     return {
         "expected_output": expected,
@@ -59,6 +192,7 @@ def validate_criteria(criteria: Any) -> dict[str, Any]:
         "max_latency_ms": criteria.get("max_latency_ms"),
         "max_tokens": criteria.get("max_tokens"),
         "max_cost_usd": criteria.get("max_cost_usd"),
+        "assertions": normalized_assertions,
     }
 
 
@@ -120,12 +254,19 @@ def _json_values_equal(actual: Any, expected: Any) -> bool:
 
 
 def _get_path(value: Any, path: str) -> Any:
+    found, current = _lookup_path(value, path)
+    return current if found else None
+
+
+def _lookup_path(value: Any, path: str) -> tuple[bool, Any]:
+    if path in {"", "$"}:
+        return True, value
     current = value
     for part in path.split("."):
         if not isinstance(current, dict) or part not in current:
-            return None
+            return False, None
         current = current[part]
-    return current
+    return True, current
 
 
 def _string_values(value: Any) -> list[str]:
@@ -150,6 +291,203 @@ def _has_error(event: Event) -> bool:
         or result.get("success") is False
         or bool(result.get("error"))
     )
+
+
+def _assertion_match(actual: Any, expected: Any, operator: str) -> tuple[bool | None, str]:
+    if operator in {"exists", "not_exists"}:
+        present = actual is not _MISSING
+        return (
+            present if operator == "exists" else not present,
+            "The selected value exists." if present else "The selected value is missing.",
+        )
+    if actual is _MISSING:
+        return None, "The selected value is unavailable because its path is missing."
+    if operator in {"eq", "exact"}:
+        compatible = type(actual) is type(expected) or (
+            isinstance(actual, (int, float))
+            and not isinstance(actual, bool)
+            and isinstance(expected, (int, float))
+            and not isinstance(expected, bool)
+        )
+        if not compatible:
+            return False, "The recorded value has an incompatible JSON type."
+        matched = _json_values_equal(actual, expected)
+        return matched, "The value exactly matches." if matched else "The value does not match."
+    if operator == "ne":
+        compatible = type(actual) is type(expected) or (
+            isinstance(actual, (int, float))
+            and not isinstance(actual, bool)
+            and isinstance(expected, (int, float))
+            and not isinstance(expected, bool)
+        )
+        if not compatible:
+            return False, "The recorded value has an incompatible JSON type."
+        matched = not _json_values_equal(actual, expected)
+        return (
+            matched,
+            "The value differs as expected."
+            if matched
+            else "The value equals the forbidden value.",
+        )
+    if operator in {"gt", "gte", "lt", "lte", "between"}:
+        if isinstance(actual, bool) or not isinstance(actual, (int, float)):
+            return False, "The recorded value is not numeric."
+        if operator == "between":
+            matched = expected[0] <= actual <= expected[1]
+            return matched, (
+                f"The number is within [{expected[0]}, {expected[1]}]."
+                if matched
+                else f"The number is outside [{expected[0]}, {expected[1]}]."
+            )
+        matched = {
+            "gt": actual > expected,
+            "gte": actual >= expected,
+            "lt": actual < expected,
+            "lte": actual <= expected,
+        }[operator]
+        return matched, (
+            f"The number satisfies {operator} {expected}."
+            if matched
+            else f"The number does not satisfy {operator} {expected}."
+        )
+    if operator in {"contains", "not_contains"}:
+        if not isinstance(actual, str):
+            return False, "The recorded value is not a string."
+        matched = expected in actual
+        if operator == "not_contains":
+            matched = not matched
+        return matched, (
+            "The string satisfies the configured containment check."
+            if matched
+            else "The string does not satisfy the configured containment check."
+        )
+    if operator in {"includes", "not_includes"}:
+        if isinstance(actual, list):
+            matched = any(_json_values_equal(item, expected) for item in actual)
+        elif isinstance(actual, dict) and isinstance(expected, str):
+            matched = expected in actual
+        else:
+            return False, "The recorded value is not an array or object supporting membership."
+        if operator == "not_includes":
+            matched = not matched
+        return matched, (
+            "The membership check passed." if matched else "The membership check failed."
+        )
+    if operator in {"length_eq", "length_gt", "length_lt"}:
+        if not isinstance(actual, (str, list, dict)):
+            return False, "The recorded value has no supported length."
+        size = len(actual)
+        matched = {
+            "length_eq": size == expected,
+            "length_gt": size > expected,
+            "length_lt": size < expected,
+        }[operator]
+        return matched, f"Recorded length is {size}; configured check is {operator} {expected}."
+    raise ValueError(f"Unsupported assertion operator '{operator}'.")
+
+
+_MISSING = object()
+
+
+def _evaluate_assertions(
+    session_id: str,
+    events: list[Event],
+    criteria: dict[str, Any],
+    output: Any,
+    output_available: bool,
+    metrics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    evaluated = []
+    for assertion in criteria["assertions"]:
+        source = assertion["source"]
+        target_event: Event | None = None
+        if source == "output":
+            source_available = output_available
+            source_value = output if source_available else _MISSING
+            target_event = events[-1] if events else None
+        elif source in {"event_result", "event_error"}:
+            target_event = next(
+                (
+                    event
+                    for event in events
+                    if event.seq == assertion["event_seq"]
+                    and (assertion["event_type"] is None or event.type == assertion["event_type"])
+                    and (assertion["event_name"] is None or event.name == assertion["event_name"])
+                ),
+                None,
+            )
+            source_available = target_event is not None
+            if source == "event_result":
+                source_available = source_available and target_event.result_json is not None
+                source_value = (
+                    _decode_result(target_event.result_json)
+                    if source_available and target_event
+                    else _MISSING
+                )
+            elif target_event is None:
+                source_value = _MISSING
+            elif _has_error(target_event):
+                source_value = (
+                    target_event.error or target_event.error_type or "recorded failure result"
+                )
+            else:
+                source_value = _MISSING
+        else:
+            metric = metrics[assertion["path"]]
+            source_available = metric["value"] is not None
+            source_value = metric["value"] if source_available else _MISSING
+
+        if source == "metric":
+            found, actual = source_available, source_value
+        elif source == "event_error":
+            found, actual = source_available, source_value
+        else:
+            found, actual = (
+                _lookup_path(source_value, assertion["path"]) if source_available else (False, None)
+            )
+        operator = assertion["operator"]
+        if not source_available:
+            status = "unavailable"
+            explanation = "The selected recorded event or metric is unavailable."
+        elif not found and operator not in {"exists", "not_exists"}:
+            status = "unavailable"
+            explanation = "The selected path is missing from the recorded evidence."
+        else:
+            outcome, explanation = _assertion_match(
+                actual if found else _MISSING,
+                assertion.get("expected"),
+                operator,
+            )
+            status = "unavailable" if outcome is None else "passed" if outcome else "failed"
+
+        evidence = (
+            [
+                {
+                    "session_id": session_id,
+                    "seq": target_event.seq,
+                    "type": target_event.type,
+                    "name": target_event.name,
+                }
+            ]
+            if target_event is not None
+            else []
+        )
+        expected_value = assertion.get("expected")
+        evaluated.append(
+            {
+                "id": assertion["id"],
+                "name": assertion["name"],
+                "source": source,
+                "path": assertion["path"],
+                "operator": operator,
+                "expected": expected_value,
+                "actual": actual if found else None,
+                "status": status,
+                "explanation": explanation,
+                "evidence": evidence,
+            }
+        )
+    return evaluated
 
 
 def _evaluate_session(
@@ -382,7 +720,40 @@ def _evaluate_session(
         ],
     }
 
+    assertion_results = _evaluate_assertions(
+        session_id,
+        events,
+        criteria,
+        output,
+        output_available,
+        results["efficiency"]["metrics"],
+    )
+    if assertion_results:
+        results["assertions"] = {
+            "name": "Configured deterministic assertions",
+            "version": EVALUATOR_VERSION,
+            "status": (
+                "failed"
+                if any(item["status"] == "failed" for item in assertion_results)
+                else "unavailable"
+                if all(item["status"] == "unavailable" for item in assertion_results)
+                else "partial"
+                if any(item["status"] == "unavailable" for item in assertion_results)
+                else "passed"
+            ),
+            "explanation": (
+                "Each configured assertion is evaluated independently against recorded evidence."
+            ),
+            "results": assertion_results,
+            "evidence": [
+                evidence_item for item in assertion_results for evidence_item in item["evidence"]
+            ],
+            "limitations": [],
+        }
+        active_statuses.append(results["assertions"]["status"])
+
     quality_configured = expected is not None or bool(required_fields) or bool(required_phrases)
+    quality_configured = quality_configured or bool(criteria["assertions"])
     if "failed" in active_statuses:
         overall = "failed"
     elif "unavailable" in active_statuses or "partial" in active_statuses:
@@ -414,6 +785,7 @@ def _evaluate_session(
         "required_information": "Required information",
         "execution_errors": "Recorded execution errors",
         "efficiency": "Execution efficiency thresholds",
+        "assertions": "Configured deterministic assertions",
     }
     for evaluator_name, evaluator_result in results.items():
         evaluator_result["name"] = evaluator_names[evaluator_name]
@@ -450,22 +822,53 @@ def compare_evaluations(baseline: dict[str, Any], fork: dict[str, Any]) -> dict[
     improvements = []
     regressions = []
     unchanged = []
+    not_comparable = []
+    ranking = {"passed": 2, "partial": 1, "failed": 0}
+
+    def classify_change(name: str, base_status: str, fork_status: str) -> None:
+        if base_status == fork_status:
+            unchanged.append(name)
+        elif base_status not in ranking or fork_status not in ranking:
+            not_comparable.append(name)
+        elif ranking[fork_status] > ranking[base_status]:
+            improvements.append(name)
+        elif ranking[fork_status] < ranking[base_status]:
+            regressions.append(name)
+        else:
+            not_comparable.append(name)
+
     for name in ("expected_output", "required_information", "execution_errors", "efficiency"):
         base = baseline["evaluators"][name]
         variant = fork["evaluators"][name]
         pair = {"baseline": base["status"], "fork": variant["status"]}
         differences[name] = pair
-        ranking = {"passed": 2, "partial": 1, "unavailable": 0, "not_configured": 0, "failed": 0}
-        if ranking[variant["status"]] > ranking[base["status"]]:
-            improvements.append(name)
-        elif ranking[variant["status"]] < ranking[base["status"]]:
-            regressions.append(name)
-        else:
-            unchanged.append(name)
+        classify_change(name, pair["baseline"], pair["fork"])
+    baseline_assertions = {
+        item["id"]: item
+        for item in baseline.get("evaluators", {}).get("assertions", {}).get("results", [])
+    }
+    fork_assertions = {
+        item["id"]: item
+        for item in fork.get("evaluators", {}).get("assertions", {}).get("results", [])
+    }
+    for assertion_id in sorted(set(baseline_assertions) | set(fork_assertions)):
+        base = baseline_assertions.get(assertion_id)
+        variant = fork_assertions.get(assertion_id)
+        base_status = base["status"] if base else "unavailable"
+        fork_status = variant["status"] if variant else "unavailable"
+        differences[f"assertion:{assertion_id}"] = {
+            "baseline": base_status,
+            "fork": fork_status,
+        }
+        classify_change(f"assertion:{assertion_id}", base_status, fork_status)
     return {
         "criteria_statuses": differences,
         "improvements": improvements,
         "regressions": regressions,
         "unchanged": unchanged,
-        "note": "Status comparison only; no weighted aggregate score is calculated.",
+        "not_comparable": not_comparable,
+        "note": (
+            "Status comparison only; unavailable evidence is not treated as an improvement "
+            "or a regression, and no weighted aggregate score is calculated."
+        ),
     }

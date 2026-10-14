@@ -13,6 +13,7 @@
 | M8 | Security hardening, DOM-safe rendering, CORS restriction, testing, and documentation |
 | Phase 1 foundation | Persisted guided comparisons from supported recorded sessions, explicit usage/cost availability, connected section navigation, and live-monitor capability reporting |
 | Phase 2 | Deterministic configurable evaluation of recorded session outputs and persisted baseline/fork comparisons, with evidence, versioning, and append-only history |
+| Phase 3 | Reusable versioned evaluation suites, safe deterministic assertions, suite-based experiment comparisons, and persisted strict replay validation history |
 
 ## Current status
 
@@ -46,6 +47,19 @@ The local implementation is functional and validated by the automated test suite
   continue to come only from configured server-side providers and are labeled as provider output.
 - Strict replay validity is separate from task/output quality. Session evaluation does not execute
   replay; saved experiment evaluation reports the strict replay evidence already recorded there.
-- Future work includes reusable named criteria sets, richer structured assertions, persisted
-  replay-divergence runs, and calibrated quality evaluators. Efficiency remains descriptive and
-  estimated cost is not provider-confirmed billing.
+- Efficiency remains descriptive and estimated cost is not provider-confirmed billing.
+
+## Phase 3 reusable evaluation and replay validation
+
+- Named evaluation suites are persisted as immutable versions. Evaluation records keep the suite
+  ID/version and the exact normalized criteria snapshot used for that run.
+- Deterministic assertions can inspect selected recorded output fields, event results/errors, or
+  supported aggregate metrics. Missing evidence is unavailable; no arbitrary user code or LLM
+  judge is executed.
+- Guided experiment evaluations can apply one suite version to both baseline and fork and report
+  per-check status changes without hiding failures in an aggregate score.
+- Strict replay validations are persisted independently from quality evaluations. Each validation
+  records event-level match, divergence, missing-result, or unchecked evidence and explicitly does
+  not rerun an agent.
+- Live monitoring remains a session-store refresh rather than an event stream, and scenario
+  execution remains disabled unless explicitly enabled by server configuration.

@@ -16,12 +16,17 @@ from pydantic import BaseModel
 from agent_replay.config import CONFIG_MUTATIONS_ENABLED, LIVE_RUN_ENABLED, USD_TO_INR
 from agent_replay.detector.config import DetectorConfig
 from agent_replay.detector.engine import DetectorEngine
-from agent_replay.evaluation import compare_evaluations, evaluate_session, validate_criteria
+from agent_replay.evaluation import (
+    EVALUATOR_VERSION,
+    compare_evaluations,
+    evaluate_session,
+    validate_criteria,
+)
 from agent_replay.models import Event
 from agent_replay.pricing import get_price_engine
 from agent_replay.providers import call_provider, configured_providers
 from agent_replay.replay.engine import ReplayEngine
-from agent_replay.replay.exceptions import ReplayDivergenceError
+from agent_replay.replay.exceptions import ReplayCompletedError, ReplayDivergenceError
 from agent_replay.replay.experiment import (
     list_supported_baselines,
     run_counterfactual_experiment,
@@ -194,8 +199,24 @@ class ExperimentRequest(BaseModel):
 
 
 class EvaluationRequest(BaseModel):
-    criteria: dict[str, Any]
+    criteria: dict[str, Any] | None = None
+    suite_id: str | None = None
+    suite_version: int | None = None
     replay_calls: list[ReplayCallRequest] | None = None
+
+
+class EvaluationSuiteCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    criteria: dict[str, Any]
+
+
+class EvaluationSuiteUpdateRequest(EvaluationSuiteCreateRequest):
+    current_version: int
+
+
+class ReplayValidationRequest(BaseModel):
+    calls: list[ReplayCallRequest] | None = None
 
 
 def _experiment_snapshot_events(session_id: str, raw_events: list[dict[str, Any]]) -> list[Event]:
@@ -205,6 +226,42 @@ def _experiment_snapshot_events(session_id: str, raw_events: list[dict[str, Any]
         event_data["session_id"] = session_id
         events.append(Event(**event_data))
     return events
+
+
+def _suite_templates() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "output-correctness",
+            "name": "Output correctness",
+            "description": "Check explicit expected JSON values in a recorded result.",
+            "criteria": {"expected_output": {"result": "expected value"}},
+        },
+        {
+            "id": "required-information",
+            "name": "Required information",
+            "description": "Require selected output fields and phrases.",
+            "criteria": {
+                "required_fields": ["answer"],
+                "required_phrases": [],
+            },
+        },
+        {
+            "id": "tool-errors",
+            "name": "Tool execution errors",
+            "description": "Fail when recorded calls contain an error or failure result.",
+            "criteria": {"allow_tool_errors": False},
+        },
+        {
+            "id": "resource-limits",
+            "name": "Resource limits",
+            "description": "Check available recorded duration, token usage, and estimated cost.",
+            "criteria": {
+                "max_latency_ms": 5000,
+                "max_tokens": 2000,
+                "max_cost_usd": 0.02,
+            },
+        },
+    ]
 
 
 def _decode_json(value: str | None) -> Any:
@@ -272,6 +329,42 @@ def create_app(
         storage=actual_storage,
         detector=DetectorEngine(config=detector_config),
     )
+
+    def resolve_evaluation_criteria(
+        request: EvaluationRequest,
+    ) -> tuple[dict[str, Any], str | None, int | None]:
+        suite_id = request.suite_id
+        suite_version = request.suite_version
+        if suite_id:
+            if request.criteria is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide either suite_id or criteria, not both.",
+                )
+            suite = actual_storage.get_evaluation_suite(suite_id, suite_version)
+            if suite is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Evaluation suite '{suite_id}' was not found.",
+                )
+            raw_criteria = suite["criteria"]
+            suite_version = suite["version"]
+        else:
+            if suite_version is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="suite_version requires suite_id.",
+                )
+            if request.criteria is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide criteria or select a saved evaluation suite.",
+                )
+            raw_criteria = request.criteria
+        try:
+            return validate_criteria(raw_criteria), suite_id, suite_version
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     static_dir = Path(__file__).parent / "ui" / "static"
 
@@ -699,6 +792,188 @@ def create_app(
             "halted": any(event["status"] == "diverged" for event in results),
         }
 
+    @app.get("/api/sessions/{session_id}/replay-validations")
+    def list_replay_validations(session_id: str) -> dict[str, Any]:
+        if not actual_storage.get_session(session_id):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        return {"validations": actual_storage.list_replay_validations(session_id)}
+
+    @app.post("/api/sessions/{session_id}/replay-validations")
+    def validate_recorded_replay(
+        session_id: str, request: ReplayValidationRequest
+    ) -> dict[str, Any]:
+        if not actual_storage.get_session(session_id):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        events = actual_storage.get_events(session_id)
+        validation_id = f"replay_validation_{uuid.uuid4().hex[:12]}"
+        validated_at = datetime.now(UTC).isoformat()
+        if not events:
+            result = {
+                "session_id": session_id,
+                "status": "unavailable",
+                "explanation": "This session has no recorded events to replay.",
+                "events": [],
+                "limitations": ["No trace evidence is available."],
+            }
+            return actual_storage.create_replay_validation(
+                validation_id,
+                session_id,
+                validated_at,
+                "1.0",
+                "unavailable",
+                result,
+            )
+
+        calls = request.calls
+        if calls is None:
+            calls = [
+                ReplayCallRequest(
+                    type=event.type,
+                    name=event.name,
+                    args=_decode_json(event.args_json),
+                )
+                for event in events
+            ]
+        replay_engine = ReplayEngine(
+            session_id=session_id,
+            storage=actual_storage,
+            mode="strict",
+        )
+        event_results: list[dict[str, Any]] = []
+        failed = False
+        unavailable = False
+        for index, call in enumerate(calls):
+            event = events[index] if index < len(events) else None
+            if event is None:
+                event_results.append(
+                    {
+                        "seq": index + 1,
+                        "status": "diverged",
+                        "explanation": "Replay requested a call beyond the recorded trace.",
+                        "requested": call.model_dump(),
+                    }
+                )
+                failed = True
+                break
+            try:
+                if call.type == "tool_call":
+                    replay_engine.handle_tool_call(call.name, call.args)
+                else:
+                    replay_engine.handle_model_call(call.name, call.args)
+                if event.result_json is None:
+                    status = "missing_result"
+                    unavailable = True
+                    explanation = "The event has no recorded result or recorded error."
+                else:
+                    status = "matched"
+                    explanation = "Call matched and strict replay returned its recorded result."
+                event_results.append(
+                    {
+                        "seq": event.seq,
+                        "type": event.type,
+                        "name": event.name,
+                        "status": status,
+                        "explanation": explanation,
+                        "recorded_result": _decode_json(event.result_json),
+                    }
+                )
+            except ReplayDivergenceError as error:
+                event_results.append(
+                    {
+                        "seq": error.seq,
+                        "status": "diverged",
+                        "explanation": "Requested call does not match the recorded trace.",
+                        "expected": {
+                            "type": error.expected_type,
+                            "name": error.expected_name,
+                            "args": _decode_json(error.expected_args),
+                        },
+                        "requested": {
+                            "type": error.actual_type,
+                            "name": error.actual_name,
+                            "args": error.actual_args,
+                        },
+                    }
+                )
+                failed = True
+                break
+            except ReplayCompletedError:
+                event_results.append(
+                    {
+                        "seq": event.seq,
+                        "status": "diverged",
+                        "explanation": (
+                            "Replay engine reported that the recorded call sequence was exhausted."
+                        ),
+                    }
+                )
+                failed = True
+                break
+            except Exception as error:
+                if event.error:
+                    event_results.append(
+                        {
+                            "seq": event.seq,
+                            "type": event.type,
+                            "name": event.name,
+                            "status": "matched_recorded_error",
+                            "explanation": (
+                                "Strict replay reproduced the error recorded for this event."
+                            ),
+                            "error": event.error,
+                            "error_type": event.error_type,
+                        }
+                    )
+                else:
+                    event_results.append(
+                        {
+                            "seq": event.seq,
+                            "type": event.type,
+                            "name": event.name,
+                            "status": "replay_error",
+                            "explanation": "Strict replay failed unexpectedly.",
+                            "error": str(error),
+                            "error_type": type(error).__name__,
+                        }
+                    )
+                    failed = True
+                    break
+
+        if not failed and len(calls) < len(events):
+            unavailable = True
+            event_results.extend(
+                {
+                    "seq": event.seq,
+                    "type": event.type,
+                    "name": event.name,
+                    "status": "not_checked",
+                    "explanation": "No replay call was supplied for this recorded event.",
+                }
+                for event in events[len(calls) :]
+            )
+        status = "failed" if failed else "partial" if unavailable else "passed"
+        result = {
+            "session_id": session_id,
+            "status": status,
+            "explanation": {
+                "passed": "Strict replay validated the complete supplied call sequence.",
+                "failed": "Strict replay found a divergence or unexpected replay error.",
+                "partial": "Some recorded events had missing results or were not checked.",
+            }[status],
+            "events": event_results,
+            "limitations": [
+                "Validation uses the existing recorded trace; it does not rerun an agent."
+            ],
+        }
+        return actual_storage.create_replay_validation(
+            validation_id,
+            session_id,
+            validated_at,
+            "1.0",
+            status,
+            result,
+        )
+
     @app.get("/api/evaluations")
     def list_evaluations(
         session_id: str | None = Query(default=None, min_length=1),
@@ -711,14 +986,105 @@ def create_app(
             )
         }
 
-    @app.post("/api/evaluations/sessions/{session_id}")
-    def evaluate_recorded_session(session_id: str, request: EvaluationRequest) -> dict[str, Any]:
-        if not actual_storage.get_session(session_id):
-            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    @app.get("/api/evaluation-suites/templates")
+    def get_evaluation_suite_templates() -> dict[str, Any]:
+        return {"templates": _suite_templates()}
+
+    @app.get("/api/evaluation-suites")
+    def list_evaluation_suites() -> dict[str, Any]:
+        return {"suites": actual_storage.list_evaluation_suites()}
+
+    @app.post("/api/evaluation-suites")
+    def create_evaluation_suite(request: EvaluationSuiteCreateRequest) -> dict[str, Any]:
+        name = request.name.strip()
+        description = request.description.strip()
+        if not name or len(name) > 100:
+            raise HTTPException(status_code=422, detail="Suite name must be 1 to 100 characters.")
+        if len(description) > 500:
+            raise HTTPException(
+                status_code=422, detail="Suite description must be at most 500 characters."
+            )
         try:
             criteria = validate_criteria(request.criteria)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        suite_id = f"suite_{uuid.uuid4().hex[:12]}"
+        return actual_storage.create_evaluation_suite(
+            suite_id=suite_id,
+            version=1,
+            name=name,
+            description=description,
+            criteria=criteria,
+            evaluator_version=EVALUATOR_VERSION,
+        )
+
+    @app.get("/api/evaluation-suites/{suite_id}/versions")
+    def list_evaluation_suite_versions(suite_id: str) -> dict[str, Any]:
+        versions = actual_storage.list_evaluation_suite_versions(suite_id)
+        if not versions:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Evaluation suite '{suite_id}' was not found.",
+            )
+        return {"suite_id": suite_id, "versions": versions}
+
+    @app.get("/api/evaluation-suites/{suite_id}")
+    def get_evaluation_suite(
+        suite_id: str, version: int | None = Query(default=None, ge=1)
+    ) -> dict[str, Any]:
+        suite = actual_storage.get_evaluation_suite(suite_id, version)
+        if suite is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Evaluation suite '{suite_id}' version {version or 'latest'} was not found."
+                ),
+            )
+        return suite
+
+    @app.put("/api/evaluation-suites/{suite_id}")
+    def update_evaluation_suite(
+        suite_id: str, request: EvaluationSuiteUpdateRequest
+    ) -> dict[str, Any]:
+        current = actual_storage.get_evaluation_suite(suite_id)
+        if current is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Evaluation suite '{suite_id}' was not found.",
+            )
+        if request.current_version != current["version"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Suite is now version {current['version']}; reload it before saving changes."
+                ),
+            )
+        name = request.name.strip()
+        description = request.description.strip()
+        if not name or len(name) > 100:
+            raise HTTPException(status_code=422, detail="Suite name must be 1 to 100 characters.")
+        if len(description) > 500:
+            raise HTTPException(
+                status_code=422, detail="Suite description must be at most 500 characters."
+            )
+        try:
+            criteria = validate_criteria(request.criteria)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return actual_storage.create_evaluation_suite(
+            suite_id=suite_id,
+            version=current["version"] + 1,
+            name=name,
+            description=description,
+            criteria=criteria,
+            evaluator_version=EVALUATOR_VERSION,
+        )
+
+    @app.post("/api/evaluations/sessions/{session_id}")
+    def evaluate_recorded_session(session_id: str, request: EvaluationRequest) -> dict[str, Any]:
+        if not actual_storage.get_session(session_id):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        criteria, suite_id, suite_version = resolve_evaluation_criteria(request)
         events = actual_storage.get_events(session_id)
         result = evaluate_session(session_id, events, criteria)
         if request.replay_calls is not None:
@@ -815,6 +1181,8 @@ def create_app(
                     "Replay validation was incomplete because not all recorded calls were supplied."
                 )
         evaluation_id = f"evaluation_{uuid.uuid4().hex[:12]}"
+        result["suite_id"] = suite_id
+        result["suite_version"] = suite_version
         record = actual_storage.create_evaluation(
             evaluation_id=evaluation_id,
             target_type="session",
@@ -822,6 +1190,8 @@ def create_app(
             experiment_id=None,
             criteria=criteria,
             result=result,
+            suite_id=suite_id,
+            suite_version=suite_version,
         )
         return record
 
@@ -851,10 +1221,7 @@ def create_app(
         experiment = actual_storage.get_experiment(experiment_id)
         if not experiment:
             raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
-        try:
-            criteria = validate_criteria(request.criteria)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        criteria, suite_id, suite_version = resolve_evaluation_criteria(request)
 
         experiment_result = experiment["result"]
         baseline_id = experiment["baseline_session_id"]
@@ -877,6 +1244,8 @@ def create_app(
         fork = evaluate_session(fork_id, fork_events, criteria)
         result = {
             "experiment_id": experiment_id,
+            "suite_id": suite_id,
+            "suite_version": suite_version,
             "evaluator_version": baseline["evaluator_version"],
             "evaluated_at": datetime.now(UTC).isoformat(),
             "status": (
@@ -911,6 +1280,8 @@ def create_app(
             experiment_id=experiment_id,
             criteria=criteria,
             result=result,
+            suite_id=suite_id,
+            suite_version=suite_version,
         )
 
     @app.post("/api/experiments")
