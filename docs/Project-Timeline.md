@@ -14,6 +14,7 @@
 | Phase 1 foundation | Persisted guided comparisons from supported recorded sessions, explicit usage/cost availability, connected section navigation, and live-monitor capability reporting |
 | Phase 2 | Deterministic configurable evaluation of recorded session outputs and persisted baseline/fork comparisons, with evidence, versioning, and append-only history |
 | Phase 3 | Reusable versioned evaluation suites, safe deterministic assertions, suite-based experiment comparisons, and persisted strict replay validation history |
+| Phase 4 | Bounded, authenticated-when-remote, model-only live runs with incremental session events, persistent run status, configured-model selection, and provider-adapter hardening |
 
 ## Current status
 
@@ -63,3 +64,32 @@ The local implementation is functional and validated by the automated test suite
   not rerun an agent.
 - Live monitoring remains a session-store refresh rather than an event stream, and scenario
   execution remains disabled unless explicitly enabled by server configuration.
+
+## Phase 4 bounded live execution
+
+- The Live Monitor launches one explicitly requested call to one configured OpenAI, Anthropic, or
+  Gemini model. It does not invoke tools or rerun an arbitrary agent graph. Model choice is limited
+  to the model configured for that provider, with a maximum 8,000-character prompt and 1,024-token
+  response cap.
+- `LIVE_RUN_ENABLED` remains false by default. Loopback requests can use the local development UI
+  when enabled. Remote provider execution through Live Run and Playground requires a separate
+  server-configured `LIVE_RUN_AUTH_TOKEN`; the token is submitted transiently and is not stored in
+  browser storage. Provider API keys remain server-side. Remote pricing/detector updates also remain
+  disabled unless enabled, and then require the separate `CONFIG_MUTATIONS_AUTH_TOKEN`.
+- Run status and one model-call event are persisted in the existing session/event store. The event
+  is written before the provider request, then finalized with the recorded output, reported token
+  usage, duration, and configured-rate cost estimate when available. Provider failures retain a
+  failed event and terminal `failed` status. The UI polls persisted status; provider output is not
+  streamed.
+- Provider HTTP calls are limited to 30 seconds, with one in-process provider call at a time and
+  no automatic retries. Worker/process interruption can leave a run non-terminal; cross-process
+  concurrency and cancellation are not implemented.
+- OpenAI requests use the server-side bearer credential; Gemini credentials are sent in a header
+  rather than a URL. Responses with missing usage remain unavailable rather than synthesizing
+  token counts. Costs are estimates from configured rates, never provider-confirmed billing.
+- The API provider catalog returns configured models only. Defaults are `gpt-4o-mini`,
+  `claude-3-5-haiku-latest`, and the Gemini `DEFAULT_MODEL`; OpenAI/Anthropic models can be set
+  with `OPENAI_MODEL` and `ANTHROPIC_MODEL`.
+- No real provider call, deployment, or browser automation is claimed as part of this phase.
+  Remote deployment configuration must keep `LIVE_RUN_ENABLED` off unless the separate auth token
+  is installed and protected.

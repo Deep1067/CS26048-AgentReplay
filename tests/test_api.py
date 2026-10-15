@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from agent_replay.api import create_app
 from agent_replay.models import Event
+from agent_replay.providers import ProviderResponse
 from agent_replay.storage import SQLiteStorage
 
 
@@ -582,6 +583,171 @@ def test_api_live_run_disabled_by_default(client):
     res = client.post("/api/live/run", json={"scenario_id": "scenario_1_loop"})
     assert res.status_code == 503
     assert res.json()["detail"] == "Live execution is not enabled on this server."
+
+
+def test_live_model_run_persists_incrementally_and_can_be_evaluated(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "server-only-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "mock-live-model")
+    storage = SQLiteStorage(db_path=":memory:")
+    app = create_app(storage=storage, live_run_enabled=True)
+    client = TestClient(app)
+    captured = {}
+
+    def fake_provider(provider, prompt, model):
+        captured["prompt"] = prompt
+        captured["provider"] = provider
+        captured["model"] = model
+        return ProviderResponse(
+            text="answer with api_key=hiddenvalue123",
+            provider=provider,
+            model=model,
+            usage={"input_tokens": 11, "output_tokens": 5},
+        )
+
+    monkeypatch.setattr("agent_replay.api.call_provider", fake_provider)
+    response = client.post(
+        "/api/live/runs",
+        json={
+            "provider": "openai",
+            "model": "mock-live-model",
+            "prompt": "check sk-123456789012345678901234",
+        },
+    )
+
+    assert response.status_code == 202
+    created = response.json()
+    run = client.get(f"/api/live/runs/{created['run_id']}").json()
+    assert run["status"] == "completed"
+    assert run["event_count"] == 1
+    assert captured == {
+        "prompt": "check sk-123456789012345678901234",
+        "provider": "openai",
+        "model": "mock-live-model",
+    }
+    event = run["events"][0]
+    assert event["seq"] == 1
+    assert event["provider"] == "openai"
+    assert event["tokens_in"] == 11
+    assert event["tokens_out"] == 5
+    assert event["cost_status"] == "unavailable"
+    assert "123456789012345678901234" not in event["args_json"]
+    assert "hiddenvalue123" not in event["result_json"]
+    assert client.get("/api/sessions").json()[0]["session_id"] == created["session_id"]
+    assert client.get("/api/live/runs").json()["runs"][0]["status"] == "completed"
+    usage = client.get(f"/api/usage?session_id={created['session_id']}").json()
+    assert usage["records"][0]["input_tokens"] == 11
+    assert usage["records"][0]["output_tokens"] == 5
+    assert usage["records"][0]["cost_usd"] is None
+
+    evaluation = client.post(
+        f"/api/evaluations/sessions/{created['session_id']}",
+        json={"criteria": {"expected_output": {"text": "answer with api_key=[REDACTED]"}}},
+    )
+    assert evaluation.status_code == 200
+    assert evaluation.json()["result"]["status"] == "passed"
+
+
+def test_live_model_provider_failure_is_persisted_as_failed(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "server-only-test-key")
+    storage = SQLiteStorage(db_path=":memory:")
+    client = TestClient(create_app(storage=storage, live_run_enabled=True))
+
+    def fail_provider(*_args):
+        raise RuntimeError("Provider request failed (429).")
+
+    monkeypatch.setattr("agent_replay.api.call_provider", fail_provider)
+    created = client.post(
+        "/api/live/runs",
+        json={"provider": "anthropic", "prompt": "try once"},
+    )
+
+    assert created.status_code == 202
+    run = client.get(f"/api/live/runs/{created.json()['run_id']}").json()
+    assert run["status"] == "failed"
+    assert run["error"] == "Provider request failed (429)."
+    assert run["event_count"] == 1
+    assert run["events"][0]["result_json"] is None
+    assert run["events"][0]["error"] == "Provider request failed (429)."
+
+
+def test_live_model_run_rejects_unconfigured_provider_and_invalid_inputs(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    client = TestClient(
+        create_app(storage=SQLiteStorage(db_path=":memory:"), live_run_enabled=True)
+    )
+    unavailable = client.post(
+        "/api/live/runs",
+        json={"provider": "gemini", "prompt": "task"},
+    )
+    oversized = client.post(
+        "/api/live/runs",
+        json={"provider": "openai", "prompt": "x" * 8001},
+    )
+
+    assert unavailable.status_code == 503
+    assert "No usable model" in unavailable.json()["detail"]
+    assert oversized.status_code == 422
+
+
+def test_remote_provider_execution_requires_server_token(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "server-only-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "mock-live-model")
+    monkeypatch.delenv("LIVE_RUN_AUTH_TOKEN", raising=False)
+    app = create_app(storage=SQLiteStorage(db_path=":memory:"), live_run_enabled=True)
+    client = TestClient(app, client=("203.0.113.10", 12345))
+
+    blocked = client.post(
+        "/api/live/runs",
+        json={"provider": "openai", "prompt": "task"},
+    )
+    monkeypatch.setenv("LIVE_RUN_AUTH_TOKEN", "remote-test-token")
+    monkeypatch.setattr(
+        "agent_replay.api.call_provider",
+        lambda provider, prompt, model: ProviderResponse("done", provider, model),
+    )
+    unauthorized = client.post(
+        "/api/live/runs",
+        json={"provider": "openai", "prompt": "task"},
+    )
+    authorized = client.post(
+        "/api/live/runs",
+        headers={"Authorization": "Bearer remote-test-token"},
+        json={"provider": "openai", "prompt": "task"},
+    )
+
+    assert blocked.status_code == 503
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 202
+
+
+def test_remote_configuration_mutations_require_separate_admin_token(monkeypatch):
+    monkeypatch.delenv("CONFIG_MUTATIONS_AUTH_TOKEN", raising=False)
+    app = create_app(
+        storage=SQLiteStorage(db_path=":memory:"),
+        config_mutations_enabled=True,
+    )
+    client = TestClient(app, client=("203.0.113.11", 12345))
+    original = client.get("/api/prices").json()
+    update = {
+        "models": {
+            "untrusted-model": {
+                "input_inr_per_1k": 1,
+                "output_inr_per_1k": 1,
+            }
+        }
+    }
+
+    missing_token = client.put("/api/prices", json=update)
+    monkeypatch.setenv("CONFIG_MUTATIONS_AUTH_TOKEN", "separate-admin-token")
+    invalid_token = client.put(
+        "/api/prices",
+        headers={"Authorization": "Bearer wrong-token"},
+        json=update,
+    )
+
+    assert missing_token.status_code == 503
+    assert invalid_token.status_code == 401
+    assert client.get("/api/prices").json() == original
 
 
 def test_api_live_run_success_and_step_cap(client):

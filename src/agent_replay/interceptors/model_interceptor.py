@@ -43,28 +43,32 @@ def _serialize_generations(generations: list[list[Any]]) -> str:
     return json.dumps(res)
 
 
-def _extract_tokens(response: LLMResult) -> tuple[int, int]:
-    tokens_in = 0
-    tokens_out = 0
+def _usage_count(usage: Any, *keys: str) -> int | None:
+    for key in keys:
+        value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
 
+
+def _extract_tokens(response: LLMResult) -> tuple[int | None, int | None]:
     if response.llm_output and "token_usage" in response.llm_output:
         usage = response.llm_output["token_usage"]
-        tokens_in = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-        tokens_out = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        tokens_in = _usage_count(usage, "prompt_tokens", "input_tokens")
+        tokens_out = _usage_count(usage, "completion_tokens", "output_tokens")
+        if tokens_in is not None or tokens_out is not None:
+            return tokens_in, tokens_out
 
-    if tokens_in == 0 and tokens_out == 0:
-        for gen_list in response.generations:
-            for gen in gen_list:
-                msg = getattr(gen, "message", None)
-                if msg and hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                    meta = msg.usage_metadata
-                    getter = (
-                        meta.get if isinstance(meta, dict) else lambda key: getattr(meta, key, None)
-                    )
-                    tokens_in = getter("input_tokens") or getter("prompt_token_count") or 0
-                    tokens_out = getter("output_tokens") or getter("candidates_token_count") or 0
-                    break
-    return int(tokens_in), int(tokens_out)
+    for gen_list in response.generations:
+        for gen in gen_list:
+            msg = getattr(gen, "message", None)
+            if msg and hasattr(msg, "usage_metadata") and msg.usage_metadata:
+                usage = msg.usage_metadata
+                return (
+                    _usage_count(usage, "input_tokens", "prompt_token_count"),
+                    _usage_count(usage, "output_tokens", "candidates_token_count"),
+                )
+    return None, None
 
 
 class ReplayModelCallbackHandler(BaseCallbackHandler):
@@ -127,7 +131,9 @@ class ReplayModelCallbackHandler(BaseCallbackHandler):
             cost_usd=cost or 0.0,
             provider=run_data.get("provider"),
             model=run_data["model_name"],
-            tokens_total=tokens_in + tokens_out,
+            tokens_total=(
+                tokens_in + tokens_out if tokens_in is not None and tokens_out is not None else None
+            ),
             cost_status="estimated" if cost is not None else "unavailable",
             cost_currency="USD" if cost is not None else None,
         )
@@ -176,15 +182,15 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
     result = None
     error_msg = None
     error_type = None
-    tokens_in = 0
-    tokens_out = 0
+    tokens_in: int | None = None
+    tokens_out: int | None = None
 
     try:
         result = fn(*args, **kwargs)
         if hasattr(result, "usage_metadata") and result.usage_metadata:
             meta = result.usage_metadata
-            tokens_in = getattr(meta, "prompt_token_count", 0) or 0
-            tokens_out = getattr(meta, "candidates_token_count", 0) or 0
+            tokens_in = _usage_count(meta, "prompt_token_count", "input_tokens")
+            tokens_out = _usage_count(meta, "candidates_token_count", "output_tokens")
         return result
     except Exception as e:
         error_msg = str(e)
@@ -213,7 +219,9 @@ def record_model_call(model_name: str, fn: Callable, *args: Any, **kwargs: Any) 
             tokens_out=tokens_out,
             cost_usd=cost or 0.0,
             model=model_name,
-            tokens_total=tokens_in + tokens_out,
+            tokens_total=(
+                tokens_in + tokens_out if tokens_in is not None and tokens_out is not None else None
+            ),
             cost_status="estimated" if cost is not None else "unavailable",
             cost_currency="USD" if cost is not None else None,
         )

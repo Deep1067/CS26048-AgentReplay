@@ -1,8 +1,4 @@
-"""Optional server-side provider adapters for the AI playground.
-
-Adapters use the standard library so AgentReplay remains usable offline and does
-not require provider SDKs until a user explicitly submits a request.
-"""
+"""Optional server-side provider adapters for the AI playground and live runs."""
 
 import json
 import os
@@ -13,25 +9,38 @@ from typing import Any
 
 from agent_replay.config import DEFAULT_MODEL
 
+_PROVIDER_SETTINGS = {
+    "openai": ("OPENAI_API_KEY", "OPENAI_MODEL", "gpt-4o-mini"),
+    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
+    "gemini": ("GEMINI_API_KEY", "DEFAULT_MODEL", DEFAULT_MODEL),
+}
+_PROVIDER_TIMEOUT_SECONDS = 30
+_MAX_PROMPT_CHARS = 8000
+
 
 @dataclass
 class ProviderResponse:
     text: str
     provider: str
     model: str
-    usage: dict[str, int] | None = None
+    usage: dict[str, int | None] | None = None
 
 
 def configured_providers() -> list[dict[str, Any]]:
-    return [
-        {"id": "openai", "label": "OpenAI", "configured": bool(os.getenv("OPENAI_API_KEY"))},
-        {
-            "id": "anthropic",
-            "label": "Anthropic",
-            "configured": bool(os.getenv("ANTHROPIC_API_KEY")),
-        },
-        {"id": "gemini", "label": "Google Gemini", "configured": bool(os.getenv("GEMINI_API_KEY"))},
-    ]
+    labels = {"openai": "OpenAI", "anthropic": "Anthropic", "gemini": "Google Gemini"}
+    providers = []
+    for provider, (key_name, model_name, default_model) in _PROVIDER_SETTINGS.items():
+        configured = bool(os.getenv(key_name))
+        model = os.getenv(model_name, default_model).strip()
+        providers.append(
+            {
+                "id": provider,
+                "label": labels[provider],
+                "configured": configured,
+                "models": [model] if configured and model else [],
+            }
+        )
+    return providers
 
 
 def _post(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
@@ -42,33 +51,85 @@ def _post(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[st
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            return json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=_PROVIDER_TIMEOUT_SECONDS) as response:
+            try:
+                data = json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise RuntimeError("Provider returned an invalid response.") from None
+            if not isinstance(data, dict):
+                raise RuntimeError("Provider returned an invalid response.")
+            return data
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Provider request failed ({exc.code}).") from None
     except (urllib.error.URLError, TimeoutError):
         raise RuntimeError("Provider request could not be completed.") from None
 
 
+def _resolve_model(provider: str, requested_model: str | None) -> tuple[str, str]:
+    try:
+        key_name, model_name, default_model = _PROVIDER_SETTINGS[provider]
+    except KeyError:
+        raise ValueError("Unsupported provider.") from None
+    if not os.getenv(key_name):
+        raise RuntimeError(f"{key_name} is not configured.")
+    resolved = os.getenv(model_name, default_model).strip()
+    if not resolved:
+        raise RuntimeError(f"No model is configured for {provider}.")
+    if requested_model and requested_model != resolved:
+        raise ValueError(
+            f"Model '{requested_model}' is not configured for {provider}; "
+            "select the configured model or leave model blank."
+        )
+    return key_name, resolved
+
+
+def _usage_count(usage: Any, *keys: str) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
 def call_provider(provider: str, prompt: str, model: str | None = None) -> ProviderResponse:
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("Prompt cannot be empty.")
+    if len(prompt) > _MAX_PROMPT_CHARS:
+        raise ValueError(f"Prompt must be at most {_MAX_PROMPT_CHARS} characters.")
+    key_name, resolved = _resolve_model(provider, model)
+    key = os.getenv(key_name, "")
+
     if provider == "openai":
-        key = os.getenv("OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("OPENAI_API_KEY is not configured.")
-        resolved = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         data = _post(
             "https://api.openai.com/v1/chat/completions",
             {"Authorization": f"Bearer {key}"},
-            {"model": resolved, "messages": [{"role": "user", "content": prompt}]},
+            {
+                "model": resolved,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1024,
+            },
         )
-        usage = data.get("usage")
-        return ProviderResponse(data["choices"][0]["message"]["content"], provider, resolved, usage)
+        raw_usage = data.get("usage") or {}
+        usage = {
+            "input_tokens": _usage_count(raw_usage, "prompt_tokens"),
+            "output_tokens": _usage_count(raw_usage, "completion_tokens"),
+        }
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError("Provider returned an invalid response.") from None
+        if not isinstance(text, str):
+            raise RuntimeError("Provider returned an invalid response.")
+        return ProviderResponse(
+            text,
+            provider,
+            resolved,
+            usage if any(value is not None for value in usage.values()) else None,
+        )
 
     if provider == "anthropic":
-        key = os.getenv("ANTHROPIC_API_KEY")
-        if not key:
-            raise RuntimeError("ANTHROPIC_API_KEY is not configured.")
-        resolved = model or os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
         data = _post(
             "https://api.anthropic.com/v1/messages",
             {"x-api-key": key, "anthropic-version": "2023-06-01"},
@@ -78,36 +139,49 @@ def call_provider(provider: str, prompt: str, model: str | None = None) -> Provi
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
-        usage = data.get("usage", {})
+        raw_usage = data.get("usage", {})
+        usage = {
+            "input_tokens": _usage_count(raw_usage, "input_tokens"),
+            "output_tokens": _usage_count(raw_usage, "output_tokens"),
+        }
+        try:
+            text = data["content"][0]["text"]
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError("Provider returned an invalid response.") from None
+        if not isinstance(text, str):
+            raise RuntimeError("Provider returned an invalid response.")
         return ProviderResponse(
-            data["content"][0]["text"],
+            text,
             provider,
             resolved,
-            {
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-            },
+            usage if any(value is not None for value in usage.values()) else None,
         )
 
     if provider == "gemini":
-        key = os.getenv("GEMINI_API_KEY")
-        if not key:
-            raise RuntimeError("GEMINI_API_KEY is not configured.")
-        resolved = model or DEFAULT_MODEL
         data = _post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{resolved}:generateContent?key={key}",
-            {},
-            {"contents": [{"parts": [{"text": prompt}]}]},
+            f"https://generativelanguage.googleapis.com/v1beta/models/{resolved}:generateContent",
+            {"x-goog-api-key": key},
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 1024},
+            },
         )
-        usage = data.get("usageMetadata", {})
+        raw_usage = data.get("usageMetadata", {})
+        usage = {
+            "input_tokens": _usage_count(raw_usage, "promptTokenCount"),
+            "output_tokens": _usage_count(raw_usage, "candidatesTokenCount"),
+        }
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError("Provider returned an invalid response.") from None
+        if not isinstance(text, str):
+            raise RuntimeError("Provider returned an invalid response.")
         return ProviderResponse(
-            data["candidates"][0]["content"]["parts"][0]["text"],
+            text,
             provider,
             resolved,
-            {
-                "input_tokens": usage.get("promptTokenCount", 0),
-                "output_tokens": usage.get("candidatesTokenCount", 0),
-            },
+            usage if any(value is not None for value in usage.values()) else None,
         )
 
     raise ValueError("Unsupported provider.")

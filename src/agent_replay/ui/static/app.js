@@ -10,6 +10,7 @@ document.addEventListener("DOMContentLoaded", () => {
   let currentFilter = "all";
   let liveMonitorTimer = null;
   let liveExecutionEnabled = false;
+  let configuredProviderCatalog = [];
 
   const sessionSearchInput = document.getElementById("session-search");
   const sessionsListEl = document.getElementById("sessions-list");
@@ -56,8 +57,14 @@ document.addEventListener("DOMContentLoaded", () => {
   const detectorConfigStatus = document.getElementById("detector-config-status");
   const liveScenarioSelect = document.getElementById("live-scenario-select");
   const runLiveBtn = document.getElementById("run-live-btn");
+  const liveModelProviderSelect = document.getElementById("live-provider-select");
+  const liveModelSelect = document.getElementById("live-model-select");
+  const liveTaskPrompt = document.getElementById("live-task-prompt");
+  const liveAuthToken = document.getElementById("live-auth-token");
+  const launchLiveModelBtn = document.getElementById("launch-live-model-btn");
   const liveRunStatusEl = document.getElementById("live-run-status");
   const liveCapabilityStatus = document.getElementById("live-capability-status");
+  const liveRunHistoryEl = document.getElementById("live-run-history");
   const liveRecentSessions = document.getElementById("live-recent-sessions");
 
   const filterBtns = document.querySelectorAll(".filter-btn");
@@ -617,6 +624,7 @@ document.addEventListener("DOMContentLoaded", () => {
       fetchUsage();
     }
     if (tabName === "live") {
+      fetchProviders();
       fetchLiveScenarios();
       refreshLiveMonitor();
       if (liveMonitorTimer === null) {
@@ -735,7 +743,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   async function fetchProviders() {
       try {
-        const data = await (await fetch("/api/providers")).json();
+        const response = await fetch("/api/providers");
+        if (!response.ok) throw new Error("Unable to load provider configuration.");
+        const data = await response.json();
+        configuredProviderCatalog = data.providers;
         playgroundProvider.replaceChildren();
         data.providers.forEach(provider => {
           const option = document.createElement("option");
@@ -744,6 +755,20 @@ document.addEventListener("DOMContentLoaded", () => {
           option.disabled = !provider.configured;
           playgroundProvider.appendChild(option);
         });
+        liveModelProviderSelect.replaceChildren();
+        data.providers.forEach(provider => {
+          const option = document.createElement("option");
+          option.value = provider.id;
+          option.textContent = `${provider.label}${provider.configured ? "" : " (not configured)"}`;
+          option.disabled = !provider.configured;
+          liveModelProviderSelect.appendChild(option);
+        });
+        const firstConfigured = data.providers.find(provider => provider.configured);
+        if (firstConfigured) {
+          playgroundProvider.value = firstConfigured.id;
+          liveModelProviderSelect.value = firstConfigured.id;
+        }
+        populateLiveModels();
         const available = data.providers.filter(provider => provider.configured);
         providerNotice.textContent = available.length
           ? `${available.length} provider(s) configured. Calls are made only after you press Send.`
@@ -751,6 +776,26 @@ document.addEventListener("DOMContentLoaded", () => {
       } catch (err) {
         providerNotice.textContent = `Unable to load provider configuration: ${err.message}`;
   }
+    }
+
+    function populateLiveModels() {
+      if (!liveModelProviderSelect || !liveModelSelect) return;
+      const provider = configuredProviderCatalog.find(
+        item => item.id === liveModelProviderSelect.value && item.configured,
+      );
+      liveModelSelect.replaceChildren();
+      (provider?.models || []).forEach(model => {
+        const option = document.createElement("option");
+        option.value = model;
+        option.textContent = model;
+        liveModelSelect.appendChild(option);
+      });
+      if (!provider?.models?.length) {
+        const option = document.createElement("option");
+        option.textContent = "No configured model";
+        liveModelSelect.appendChild(option);
+      }
+      launchLiveModelBtn.disabled = !liveExecutionEnabled || !provider?.models?.length;
     }
 
     playgroundForm.addEventListener("submit", async event => {
@@ -761,9 +806,11 @@ document.addEventListener("DOMContentLoaded", () => {
       userMessage.textContent = playgroundPrompt.value;
       playgroundMessages.appendChild(userMessage);
       try {
+        const headers = {"Content-Type": "application/json"};
+        if (liveAuthToken.value) headers.Authorization = `Bearer ${liveAuthToken.value}`;
         const response = await fetch("/api/playground/chat", {
           method: "POST",
-          headers: {"Content-Type": "application/json"},
+          headers,
           body: JSON.stringify({
             provider: playgroundProvider.value,
             model: playgroundModel.value || null,
@@ -788,6 +835,7 @@ document.addEventListener("DOMContentLoaded", () => {
       } catch (err) {
         providerNotice.textContent = err.message;
       } finally {
+        liveAuthToken.value = "";
         playgroundSend.disabled = false;
       }
   });
@@ -1529,7 +1577,9 @@ document.addEventListener("DOMContentLoaded", () => {
       metaGroup.className = "card-meta-group";
       if (e.type === "model_call") {
         const tokens = document.createElement("span");
-        tokens.textContent = `Tokens: ${e.tokens_in} in / ${e.tokens_out} out`;
+        const tokensIn = e.tokens_in == null ? "unavailable" : e.tokens_in;
+        const tokensOut = e.tokens_out == null ? "unavailable" : e.tokens_out;
+        tokens.textContent = `Tokens: ${tokensIn} in / ${tokensOut} out`;
         metaGroup.appendChild(tokens);
       }
       const duration = document.createElement("span");
@@ -1597,6 +1647,7 @@ document.addEventListener("DOMContentLoaded", () => {
       liveCapabilityStatus.textContent = capability.message;
       liveExecutionEnabled = capability.execution_enabled;
       runLiveBtn.disabled = !liveExecutionEnabled;
+      populateLiveModels();
       if (!res.ok) throw new Error("Failed to load live scenarios");
       const scenarios = await res.json();
       liveScenarioSelect.replaceChildren();
@@ -1614,6 +1665,7 @@ document.addEventListener("DOMContentLoaded", () => {
     } catch (err) {
       liveExecutionEnabled = false;
       runLiveBtn.disabled = true;
+      launchLiveModelBtn.disabled = true;
       liveCapabilityStatus.textContent = `Unable to load live capability status: ${err.message}`;
       liveScenarioSelect.replaceChildren();
       const errOpt = document.createElement("option");
@@ -1631,9 +1683,33 @@ document.addEventListener("DOMContentLoaded", () => {
       populateReplaySessions(allSessions);
       renderSessionsList(allSessions);
       renderLiveRecentSessions(allSessions.slice(0, 8));
+      const runsResponse = await fetch("/api/live/runs");
+      if (!runsResponse.ok) throw new Error("Unable to refresh live run history.");
+      const runsData = await runsResponse.json();
+      renderLiveRuns(runsData.runs || []);
     } catch (err) {
       liveRecentSessions.textContent = `Unable to refresh recorded activity: ${err.message}`;
     }
+  }
+
+  function renderLiveRuns(runs) {
+    liveRunHistoryEl.replaceChildren();
+    if (!runs.length) {
+      liveRunHistoryEl.textContent = "No live model runs have been launched.";
+      return;
+    }
+    runs.forEach(run => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "overview-session";
+      button.textContent = `${run.status.toUpperCase()} · ${run.provider} / ${run.model} · ${run.event_count} event(s) · ${run.run_id}`;
+      button.addEventListener("click", async () => {
+        await fetchSessions();
+        await selectSession(run.session_id);
+        switchTab("timeline");
+      });
+      liveRunHistoryEl.appendChild(button);
+    });
   }
 
   function renderLiveRecentSessions(sessions) {
@@ -1671,9 +1747,11 @@ document.addEventListener("DOMContentLoaded", () => {
       liveRunStatusEl.appendChild(statusText);
       liveRunStatusEl.classList.remove("hidden");
 
+      const headers = { "Content-Type": "application/json" };
+      if (liveAuthToken.value) headers.Authorization = `Bearer ${liveAuthToken.value}`;
       const res = await fetch("/api/live/run", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ scenario_id: scenarioId }),
       });
       const data = await res.json();
@@ -1717,6 +1795,74 @@ document.addEventListener("DOMContentLoaded", () => {
     } finally {
       runLiveBtn.disabled = !liveExecutionEnabled;
       liveScenarioSelect.disabled = false;
+    }
+  }
+
+  async function launchLiveModelRun() {
+    if (!liveExecutionEnabled || launchLiveModelBtn.disabled) return;
+    launchLiveModelBtn.disabled = true;
+    liveRunStatusEl.className = "live-run-status running";
+    liveRunStatusEl.textContent = "Queuing one bounded provider model call...";
+    liveRunStatusEl.classList.remove("hidden");
+    const headers = { "Content-Type": "application/json" };
+    if (liveAuthToken.value) headers.Authorization = `Bearer ${liveAuthToken.value}`;
+
+    try {
+      const response = await fetch("/api/live/runs", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          provider: liveModelProviderSelect.value,
+          model: liveModelSelect.value,
+          prompt: liveTaskPrompt.value,
+        }),
+      });
+      const created = await response.json();
+      if (!response.ok) throw new Error(created.detail || "Unable to start the live run.");
+      liveAuthToken.value = "";
+      let run = created;
+      let attempts = 0;
+      while ((run.status === "queued" || run.status === "running") && attempts < 60) {
+        liveRunStatusEl.textContent =
+          `${run.status.toUpperCase()} · ${run.provider} / ${run.model} · ${run.session_id}`;
+        await new Promise(resolve => window.setTimeout(resolve, 750));
+        const statusResponse = await fetch(`/api/live/runs/${encodeURIComponent(created.run_id)}`);
+        const current = await statusResponse.json();
+        if (!statusResponse.ok) throw new Error(current.detail || "Unable to refresh run status.");
+        run = current;
+        attempts += 1;
+      }
+
+      liveRunStatusEl.replaceChildren();
+      liveRunStatusEl.className = `live-run-status ${run.status === "completed" ? "done" : "error"}`;
+      const summary = document.createElement("span");
+      summary.textContent = `${run.status.toUpperCase()} · ${run.event_count} recorded event(s)` +
+        (run.error ? ` · ${run.error}` : "");
+      liveRunStatusEl.appendChild(summary);
+      const link = document.createElement("button");
+      link.type = "button";
+      link.className = "btn-link";
+      link.textContent = `Inspect session ${run.session_id} →`;
+      link.addEventListener("click", async () => {
+        await fetchSessions();
+        await selectSession(run.session_id);
+        switchTab("timeline");
+      });
+      liveRunStatusEl.appendChild(link);
+      if (run.status === "queued" || run.status === "running") {
+        liveRunStatusEl.className = "live-run-status running";
+        const note = document.createElement("span");
+        note.textContent = "Still running; status and persisted events will refresh in the monitor.";
+        liveRunStatusEl.appendChild(note);
+      }
+      liveTaskPrompt.value = "";
+      await fetchSessions();
+      await refreshLiveMonitor();
+    } catch (err) {
+      liveRunStatusEl.className = "live-run-status error";
+      liveRunStatusEl.textContent = `Run could not be completed: ${err.message}`;
+    } finally {
+      populateLiveModels();
     }
   }
 
@@ -1777,6 +1923,8 @@ document.addEventListener("DOMContentLoaded", () => {
   if (runLiveBtn) {
     runLiveBtn.addEventListener("click", runLiveScenario);
   }
+  liveModelProviderSelect.addEventListener("change", populateLiveModels);
+  launchLiveModelBtn.addEventListener("click", launchLiveModelRun);
 
   fetchSessions();
   switchTab(window.localStorage.getItem("agent-replay-section") || "overview");

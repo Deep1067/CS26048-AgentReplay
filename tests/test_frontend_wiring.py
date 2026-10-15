@@ -65,3 +65,18 @@ def test_replay_history_and_versioned_suite_selectors_are_connected():
     assert "loadExperimentEvaluations(data.experiment_id)" in source
     assert "loadSessionEvaluationHistory(sessionId)" in source
     assert "not comparable:" in source
+
+
+def test_live_model_run_form_polls_persisted_runs_and_links_to_sessions():
+    html = APP_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="live-provider-select"' in html
+    assert 'id="live-model-select"' in html
+    assert 'id="live-task-prompt"' in html
+    assert 'id="live-auth-token"' in html
+    assert 'id="live-run-history"' in html
+    assert 'fetch("/api/live/runs"' in source
+    assert "async function launchLiveModelRun()" in source
+    assert "fetch(`/api/live/runs/${encodeURIComponent(created.run_id)}`)" in source
+    assert 'launchLiveModelBtn.addEventListener("click", launchLiveModelRun)' in source

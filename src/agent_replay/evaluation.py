@@ -614,12 +614,11 @@ def _evaluate_session(
         active_statuses.append(status)
 
     model_events = [event for event in events if event.type == "model_call"]
-    token_events = [
-        event
+    tokens_available = bool(model_events) and all(
+        event.tokens_total is not None
+        or (event.tokens_in is not None and event.tokens_out is not None)
         for event in model_events
-        if event.tokens_total is not None or event.tokens_in or event.tokens_out
-    ]
-    tokens_available = bool(model_events) and len(token_events) == len(model_events)
+    )
     total_tokens = (
         sum(
             event.tokens_total

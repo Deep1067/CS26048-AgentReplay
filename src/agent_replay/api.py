@@ -1,17 +1,22 @@
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
+import os
+import re
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent_replay.config import CONFIG_MUTATIONS_ENABLED, LIVE_RUN_ENABLED, USD_TO_INR
 from agent_replay.detector.config import DetectorConfig
@@ -110,8 +115,14 @@ SCENARIOS: dict[str, dict[str, str]] = {
 
 class LiveRunRequest(BaseModel):
     scenario_id: str
-    timeout_seconds: float | None = None
-    simulate_delay_seconds: float | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0, le=30)
+    simulate_delay_seconds: float | None = Field(default=None, ge=0, le=30)
+
+
+class LiveModelRunRequest(BaseModel):
+    provider: Literal["openai", "anthropic", "gemini"]
+    prompt: str = Field(min_length=1, max_length=8000)
+    model: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 def _run_scenario_sync(
@@ -188,8 +199,8 @@ class DetectorConfigUpdate(BaseModel):
 
 class PlaygroundRequest(BaseModel):
     provider: Literal["openai", "anthropic", "gemini"]
-    prompt: str
-    model: str | None = None
+    prompt: str = Field(min_length=1, max_length=8000)
+    model: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class ExperimentRequest(BaseModel):
@@ -291,6 +302,30 @@ def _price_response() -> dict[str, Any]:
     return {"models": models, "usd_to_inr": USD_TO_INR}
 
 
+_SECRET_TEXT_PATTERNS = (
+    re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})\b"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)((?:api[_-]?key|token|secret)\s*[:=]\s*)[^\s,;]+"),
+)
+
+
+def _redact_trace_text(value: str) -> str:
+    redacted = value
+    redacted = _SECRET_TEXT_PATTERNS[0].sub("[REDACTED]", redacted)
+    redacted = _SECRET_TEXT_PATTERNS[1].sub(r"\1[REDACTED]", redacted)
+    return _SECRET_TEXT_PATTERNS[2].sub(r"\1[REDACTED]", redacted)
+
+
+def _optional_usage_count(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 def create_app(
     storage: SQLiteStorage | None = None,
     *,
@@ -316,6 +351,7 @@ def create_app(
     allow_config_mutations = (
         CONFIG_MUTATIONS_ENABLED if config_mutations_enabled is None else config_mutations_enabled
     )
+    live_model_run_slot = threading.BoundedSemaphore(1)
     price_engine = get_price_engine()
     stored_prices = actual_storage.get_setting("prices")
     if isinstance(stored_prices, dict):
@@ -329,6 +365,79 @@ def create_app(
         storage=actual_storage,
         detector=DetectorEngine(config=detector_config),
     )
+
+    def authorize_provider_execution(request: Request) -> None:
+        client_host = request.client.host if request.client else ""
+        try:
+            is_loopback = ipaddress.ip_address(client_host).is_loopback
+        except ValueError:
+            is_loopback = client_host == "testclient"
+        if is_loopback:
+            return
+
+        configured_token = os.getenv("LIVE_RUN_AUTH_TOKEN", "")
+        if not configured_token:
+            raise HTTPException(
+                status_code=503,
+                detail="Remote provider execution requires LIVE_RUN_AUTH_TOKEN on the server.",
+            )
+        authorization = request.headers.get("authorization", "")
+        prefix = "Bearer "
+        supplied_token = authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        if not supplied_token or not hmac.compare_digest(supplied_token, configured_token):
+            raise HTTPException(
+                status_code=401, detail="Remote provider execution is unauthorized."
+            )
+
+    def authorize_config_mutation(request: Request) -> None:
+        if not allow_config_mutations:
+            raise HTTPException(
+                status_code=403,
+                detail="Configuration changes are disabled on this server.",
+            )
+        client_host = request.client.host if request.client else ""
+        try:
+            is_loopback = ipaddress.ip_address(client_host).is_loopback
+        except ValueError:
+            is_loopback = client_host == "testclient"
+        if is_loopback:
+            return
+
+        configured_token = os.getenv("CONFIG_MUTATIONS_AUTH_TOKEN", "")
+        if not configured_token:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Remote configuration changes require CONFIG_MUTATIONS_AUTH_TOKEN "
+                    "on the server."
+                ),
+            )
+        authorization = request.headers.get("authorization", "")
+        prefix = "Bearer "
+        supplied_token = authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        if not supplied_token or not hmac.compare_digest(supplied_token, configured_token):
+            raise HTTPException(
+                status_code=401,
+                detail="Remote configuration change is unauthorized.",
+            )
+
+    def configured_provider_model(provider_id: str, requested_model: str | None) -> str:
+        provider = next(
+            (item for item in configured_providers() if item["id"] == provider_id),
+            None,
+        )
+        if not provider or not provider["configured"] or not provider["models"]:
+            raise HTTPException(
+                status_code=503,
+                detail=f"No usable model is configured for {provider_id}.",
+            )
+        models = provider["models"]
+        if requested_model and requested_model not in models:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Model '{requested_model}' is not configured for {provider_id}.",
+            )
+        return requested_model or models[0]
 
     def resolve_evaluation_criteria(
         request: EvaluationRequest,
@@ -488,18 +597,33 @@ def create_app(
         return {"groups": groups, "sessions": sessions, "records": records}
 
     @app.post("/api/playground/chat")
-    def playground_chat(request: PlaygroundRequest) -> dict[str, Any]:
+    def playground_chat(request: PlaygroundRequest, http_request: Request) -> dict[str, Any]:
+        authorize_provider_execution(http_request)
         if not request.prompt.strip():
             raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+        providers = {item["id"]: item for item in configured_providers()}
+        provider_config = providers[request.provider]
+        resolved_model = (
+            configured_provider_model(request.provider, request.model)
+            if provider_config["configured"]
+            else request.model
+        )
+        if not live_model_run_slot.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail="A provider request is already running; try again when it finishes.",
+            )
         session_id = f"playground_{uuid.uuid4().hex[:12]}"
         actual_storage.create_session(session_id, metadata={"provider": request.provider})
         started_at = datetime.now(UTC).isoformat()
         started = time.perf_counter()
         try:
-            response = call_provider(request.provider, request.prompt, request.model)
+            response = call_provider(request.provider, request.prompt, resolved_model)
             usage = response.usage or {}
-            tokens_in = usage.get("input_tokens") or usage.get("prompt_tokens")
-            tokens_out = usage.get("output_tokens") or usage.get("completion_tokens")
+            tokens_in = _optional_usage_count(usage.get("input_tokens", usage.get("prompt_tokens")))
+            tokens_out = _optional_usage_count(
+                usage.get("output_tokens", usage.get("completion_tokens"))
+            )
             cost = get_price_engine().calculate_known_cost(response.model, tokens_in, tokens_out)
             actual_storage.save_event(
                 Event(
@@ -509,12 +633,12 @@ def create_app(
                     name=response.model,
                     model=response.model,
                     provider=response.provider,
-                    args_json=json.dumps({"prompt": request.prompt}),
-                    result_json=json.dumps({"text": response.text}),
+                    args_json=json.dumps({"prompt": _redact_trace_text(request.prompt)}),
+                    result_json=json.dumps({"text": _redact_trace_text(response.text)}),
                     started_at=started_at,
                     duration_ms=round((time.perf_counter() - started) * 1000, 2),
-                    tokens_in=tokens_in or 0,
-                    tokens_out=tokens_out or 0,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
                     tokens_total=(
                         tokens_in + tokens_out
                         if tokens_in is not None and tokens_out is not None
@@ -543,15 +667,17 @@ def create_app(
                     type="model_call",
                     name=request.model or request.provider,
                     provider=request.provider,
-                    model=request.model,
-                    args_json=json.dumps({"prompt": request.prompt}),
-                    error=str(exc),
+                    model=resolved_model,
+                    args_json=json.dumps({"prompt": _redact_trace_text(request.prompt)}),
+                    error=_redact_trace_text(str(exc)),
                     error_type=type(exc).__name__,
                     started_at=started_at,
                     duration_ms=round((time.perf_counter() - started) * 1000, 2),
                 )
             )
             raise HTTPException(status_code=503, detail=str(exc)) from None
+        finally:
+            live_model_run_slot.release()
 
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict[str, Any]:
@@ -623,13 +749,9 @@ def create_app(
         return _price_response()
 
     @app.put("/api/prices")
-    def update_prices(update: PriceUpdate) -> dict[str, Any]:
+    def update_prices(update: PriceUpdate, http_request: Request) -> dict[str, Any]:
         """Save INR per 1K pricing values back to prices.json."""
-        if not allow_config_mutations:
-            raise HTTPException(
-                status_code=403,
-                detail="Configuration changes are disabled on this server.",
-            )
+        authorize_config_mutation(http_request)
         if any(
             rate.input_inr_per_1k < 0 or rate.output_inr_per_1k < 0
             for rate in update.models.values()
@@ -671,12 +793,11 @@ def create_app(
         return vars(session_service.detector.config)
 
     @app.put("/api/detector-config")
-    def update_detector_config(update: DetectorConfigUpdate) -> dict[str, Any]:
-        if not allow_config_mutations:
-            raise HTTPException(
-                status_code=403,
-                detail="Configuration changes are disabled on this server.",
-            )
+    def update_detector_config(
+        update: DetectorConfigUpdate,
+        http_request: Request,
+    ) -> dict[str, Any]:
+        authorize_config_mutation(http_request)
         values = update.model_dump()
         if (
             values["max_repeated_tool_calls"] < 1
@@ -1326,11 +1447,14 @@ def create_app(
             "execution_enabled": allow_live_runs,
             "instrumented_recording_supported": True,
             "monitoring_mode": "periodic session-list refresh",
+            "model_only_runs_supported": True,
+            "remote_execution_requires_token": True,
             "message": (
-                "Server-defined live scenarios are enabled."
+                "Bounded model-only runs and fixed scenarios are enabled; remote execution "
+                "requires LIVE_RUN_AUTH_TOKEN."
                 if allow_live_runs
-                else "Live scenario execution is disabled by server configuration. "
-                "Instrumented agents can still record sessions into this server's storage."
+                else "Live execution is disabled by server configuration. Instrumented agents "
+                "can still record sessions into this server's storage."
             ),
         }
 
@@ -1338,13 +1462,207 @@ def create_app(
     def get_live_scenarios() -> dict[str, Any]:
         return SCENARIOS
 
-    @app.post("/api/live/run")
-    async def run_live_scenario(request: LiveRunRequest) -> dict[str, Any]:
+    def execute_live_model_run(
+        session_id: str,
+        provider: str,
+        model: str,
+        prompt: str,
+    ) -> None:
+        started_at = _utc_now()
+        started = time.perf_counter()
+        event = Event(
+            session_id=session_id,
+            seq=1,
+            type="model_call",
+            name=model,
+            provider=provider,
+            model=model,
+            args_json=json.dumps({"prompt": _redact_trace_text(prompt)}),
+            started_at=started_at,
+        )
+        event_saved = False
+        try:
+            actual_storage.update_session_metadata(
+                session_id,
+                {"run_status": "running", "run_started_at": started_at},
+            )
+            actual_storage.save_event(event)
+            event_saved = True
+
+            response = call_provider(provider, prompt, model)
+            usage = response.usage or {}
+            tokens_in = _optional_usage_count(usage.get("input_tokens"))
+            tokens_out = _optional_usage_count(usage.get("output_tokens"))
+            cost = price_engine.calculate_known_cost(response.model, tokens_in, tokens_out)
+            event.result_json = json.dumps({"text": _redact_trace_text(response.text)})
+            event.duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            event.tokens_in = tokens_in
+            event.tokens_out = tokens_out
+            event.tokens_total = (
+                tokens_in + tokens_out if tokens_in is not None and tokens_out is not None else None
+            )
+            event.cost_usd = cost if cost is not None else 0.0
+            event.cost_status = "estimated" if cost is not None else "unavailable"
+            event.cost_currency = "USD" if cost is not None else None
+            event.model = response.model
+            event.name = response.model
+            actual_storage.update_event(event)
+            actual_storage.update_session_metadata(
+                session_id,
+                {
+                    "run_status": "completed",
+                    "run_finished_at": _utc_now(),
+                    "run_error": None,
+                },
+            )
+        except Exception as exc:
+            logger.exception(
+                "Live provider execution failed: session_id=%s provider=%s",
+                session_id,
+                provider,
+            )
+            if event_saved:
+                event.error = _redact_trace_text(
+                    str(exc)
+                    if isinstance(exc, (RuntimeError, ValueError))
+                    else "Provider execution failed."
+                )
+                event.error_type = type(exc).__name__
+                event.duration_ms = round((time.perf_counter() - started) * 1000, 2)
+                try:
+                    actual_storage.update_event(event)
+                except Exception:
+                    logger.exception(
+                        "Unable to finalize failed live event: session_id=%s", session_id
+                    )
+            error_message = (
+                _redact_trace_text(str(exc))
+                if isinstance(exc, (RuntimeError, ValueError))
+                else "Provider execution failed; inspect server logs."
+            )
+            try:
+                actual_storage.update_session_metadata(
+                    session_id,
+                    {
+                        "run_status": "failed",
+                        "run_finished_at": _utc_now(),
+                        "run_error": error_message,
+                    },
+                )
+            except Exception:
+                logger.exception("Unable to persist live run failure: session_id=%s", session_id)
+        finally:
+            live_model_run_slot.release()
+
+    @app.get("/api/live/runs")
+    def list_live_model_runs(
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> dict[str, Any]:
+        runs = []
+        for summary in actual_storage.list_sessions():
+            metadata = actual_storage.get_session_metadata(summary.session_id)
+            if metadata.get("kind") != "live_model_run":
+                continue
+            runs.append(
+                {
+                    "run_id": summary.session_id,
+                    "session_id": summary.session_id,
+                    "status": metadata.get("run_status", "unknown"),
+                    "provider": metadata.get("provider"),
+                    "model": metadata.get("model"),
+                    "created_at": metadata.get("run_created_at"),
+                    "event_count": summary.event_count,
+                    "error": metadata.get("run_error"),
+                }
+            )
+            if len(runs) >= limit:
+                break
+        return {"runs": runs}
+
+    @app.get("/api/live/runs/{run_id}")
+    def get_live_model_run(run_id: str) -> dict[str, Any]:
+        summary = actual_storage.get_session(run_id)
+        metadata = actual_storage.get_session_metadata(run_id)
+        if not summary or metadata.get("kind") != "live_model_run":
+            raise HTTPException(status_code=404, detail=f"Live run '{run_id}' was not found.")
+        return {
+            "run_id": run_id,
+            "session_id": run_id,
+            "status": metadata.get("run_status", "unknown"),
+            "provider": metadata.get("provider"),
+            "model": metadata.get("model"),
+            "created_at": metadata.get("run_created_at"),
+            "started_at": metadata.get("run_started_at"),
+            "finished_at": metadata.get("run_finished_at"),
+            "error": metadata.get("run_error"),
+            "event_count": summary.event_count,
+            "events": [event.to_dict() for event in actual_storage.get_events(run_id)],
+        }
+
+    @app.post("/api/live/runs", status_code=202)
+    def start_live_model_run(
+        request: LiveModelRunRequest,
+        background_tasks: BackgroundTasks,
+        http_request: Request,
+    ) -> dict[str, Any]:
         if not allow_live_runs:
             raise HTTPException(
                 status_code=503,
                 detail="Live execution is not enabled on this server.",
             )
+        authorize_provider_execution(http_request)
+        if not request.prompt.strip():
+            raise HTTPException(status_code=422, detail="Prompt cannot be empty.")
+        model = configured_provider_model(request.provider, request.model)
+        if not live_model_run_slot.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail="A provider request is already running; try again when it finishes.",
+            )
+
+        session_id = f"live_{uuid.uuid4().hex}"
+        created_at = _utc_now()
+        try:
+            actual_storage.create_session(
+                session_id,
+                metadata={
+                    "kind": "live_model_run",
+                    "provider": request.provider,
+                    "model": model,
+                    "run_status": "queued",
+                    "run_created_at": created_at,
+                },
+            )
+            background_tasks.add_task(
+                execute_live_model_run,
+                session_id,
+                request.provider,
+                model,
+                request.prompt,
+            )
+        except Exception:
+            live_model_run_slot.release()
+            logger.exception("Unable to queue live run: session_id=%s", session_id)
+            raise HTTPException(status_code=500, detail="Unable to queue the live run.") from None
+        return {
+            "run_id": session_id,
+            "session_id": session_id,
+            "status": "queued",
+            "provider": request.provider,
+            "model": model,
+        }
+
+    @app.post("/api/live/run")
+    async def run_live_scenario(
+        request: LiveRunRequest,
+        http_request: Request,
+    ) -> dict[str, Any]:
+        if not allow_live_runs:
+            raise HTTPException(
+                status_code=503,
+                detail="Live execution is not enabled on this server.",
+            )
+        authorize_provider_execution(http_request)
 
         if request.scenario_id not in SCENARIOS:
             raise HTTPException(

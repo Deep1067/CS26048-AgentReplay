@@ -20,6 +20,15 @@ def _outcome(value: Any) -> Any:
         return str(value)
 
 
+def _recorded_token_counts(event: Any) -> tuple[int | None, int | None]:
+    if event.tokens_total is not None:
+        return event.tokens_in, event.tokens_out
+    return (
+        event.tokens_in if event.tokens_in else None,
+        event.tokens_out if event.tokens_out else None,
+    )
+
+
 def _event_payload(event: Any) -> dict[str, Any]:
     return event.to_dict()
 
@@ -141,13 +150,11 @@ def _metrics(baseline: list[Any], forked: list[Any]) -> dict[str, Any]:
     forked_duration = sum(event.duration_ms for event in forked)
     baseline_models = [event for event in baseline if event.type == "model_call"]
     forked_models = [event for event in forked if event.type == "model_call"]
-    usage_available = bool(
-        baseline_models
-        and forked_models
-        and (
-            any(event.tokens_in or event.tokens_out for event in baseline_models)
-            or any(event.tokens_in or event.tokens_out for event in forked_models)
-        )
+    baseline_usage = [_recorded_token_counts(event) for event in baseline_models]
+    forked_usage = [_recorded_token_counts(event) for event in forked_models]
+    usage_available = bool(baseline_models and forked_models) and all(
+        input_count is not None and output_count is not None
+        for input_count, output_count in baseline_usage + forked_usage
     )
     cost_available = bool(baseline_models or forked_models) and all(
         event.cost_status != "unavailable" for event in baseline_models + forked_models
@@ -171,16 +178,16 @@ def _metrics(baseline: list[Any], forked: list[Any]) -> dict[str, Any]:
         },
         "tokens": {
             "available": usage_available,
-            "baseline_in": sum(event.tokens_in for event in baseline_models)
+            "baseline_in": sum(input_count for input_count, _ in baseline_usage)
             if usage_available
             else None,
-            "baseline_out": sum(event.tokens_out for event in baseline_models)
+            "baseline_out": sum(output_count for _, output_count in baseline_usage)
             if usage_available
             else None,
-            "forked_in": sum(event.tokens_in for event in forked_models)
+            "forked_in": sum(input_count for input_count, _ in forked_usage)
             if usage_available
             else None,
-            "forked_out": sum(event.tokens_out for event in forked_models)
+            "forked_out": sum(output_count for _, output_count in forked_usage)
             if usage_available
             else None,
         },

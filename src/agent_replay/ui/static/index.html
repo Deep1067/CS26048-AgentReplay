@@ -271,10 +271,29 @@
         <div class="panel-card">
           <h2>Live monitoring & supported runs</h2>
           <p id="live-capability-status" class="notice-panel">Loading server capability status...</p>
-          <p class="text-muted">Instrumented agents can write directly to this server's configured storage. This view refreshes the session list periodically; it does not report individual agent running states.</p>
+          <p class="text-muted">Model-only runs make one bounded provider call; they do not execute tools or arbitrary agent graphs. Provider keys stay on the server. Runs are recorded as sessions and can be evaluated or replay-validated when evidence supports it.</p>
+          <div class="live-model-run-form">
+            <label class="control-group">
+              <span class="metric-label">Configured provider</span>
+              <select id="live-provider-select" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Configured model</span>
+              <select id="live-model-select" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Task prompt (maximum 8,000 characters)</span>
+              <textarea id="live-task-prompt" class="prompt-input" rows="4" maxlength="8000" placeholder="Enter a single model task..." required></textarea>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Remote execution token (not saved)</span>
+              <input id="live-auth-token" class="text-input" type="password" autocomplete="off" placeholder="Only required when calling a remote server">
+            </label>
+            <button id="launch-live-model-btn" class="btn btn-primary" type="button" disabled>Start model-only run</button>
+          </div>
           <div class="live-run-toolbar">
             <label class="control-group">
-              <span class="metric-label">Server-defined execution scenario</span>
+              <span class="metric-label">Legacy fixed scenario (local/trusted only)</span>
               <select id="live-scenario-select" class="select-input">
                 <option value="">Loading scenarios...</option>
               </select>
@@ -282,6 +301,9 @@
             <button id="run-live-btn" class="btn btn-primary">Run supported scenario</button>
           </div>
           <div id="live-run-status" class="live-run-status hidden"></div>
+          <h3 class="section-heading">Recent model runs</h3>
+          <div id="live-run-history" class="overview-list"><p class="text-muted">Loading live run history...</p></div>
+          <p class="text-muted">The monitor refreshes persisted sessions and run status periodically. It does not stream provider tokens; the current run's event is persisted before its provider request and finalized when the call returns.</p>
           <h3 class="section-heading">Recent recorded activity</h3>
           <div id="live-recent-sessions" class="overview-list"><p class="text-muted">Loading recorded activity...</p></div>
         </div>

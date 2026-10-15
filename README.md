@@ -93,7 +93,13 @@ Provider-backed Playground calls are optional. Set only the provider key(s) you 
 GEMINI_API_KEY=AIzaSy...
 DEFAULT_MODEL=gemini-2.0-flash
 # OPENAI_API_KEY=
+# OPENAI_MODEL=gpt-4o-mini
 # ANTHROPIC_API_KEY=
+# ANTHROPIC_MODEL=claude-3-5-haiku-latest
+# LIVE_RUN_ENABLED=false
+# LIVE_RUN_AUTH_TOKEN=
+# CONFIG_MUTATIONS_ENABLED=false
+# CONFIG_MUTATIONS_AUTH_TOKEN=
 ```
 
 The dashboard remains useful without any provider key: local recording, strict replay,
@@ -236,6 +242,43 @@ recorded call sequence and appends the attempt. `GET
 and reuses recorded results; it does not rerun an agent. Results distinguish complete matches,
 divergence, incomplete traces, and unavailable traces.
 
+### Phase 4: bounded live model runs
+
+The Live Monitor now also supports one explicitly submitted, model-only provider request. This is
+separate from strict replay and from the older fixed scenarios: it makes exactly one configured
+provider call and does not execute tools or arbitrary agent graphs. A request creates a queued
+session, changes its status to running, persists the model-call event before making the provider
+request, and then updates that event and the terminal session status to `completed` or `failed`.
+`GET /api/live/runs` lists recent runs and `GET /api/live/runs/{run_id}` returns the current status
+and persisted event evidence. The UI polls these endpoints and links the resulting session to the
+existing timeline and evaluation workflows. Provider output is not streamed token-by-token.
+
+Execution remains disabled unless the server operator sets `LIVE_RUN_ENABLED=true`. On loopback,
+the local UI can submit a run when enabled. Remote provider calls through both Live Run and
+Playground additionally require a high-entropy `LIVE_RUN_AUTH_TOKEN` configured on the server and
+sent by the user as a transient `Authorization: Bearer ...` value; the UI does not persist that
+token. The provider API keys remain server-side. This token only protects provider-execution
+requests; it is not general user authentication for session-reading APIs. Keep deployments private
+or add application authentication before exposing stored session data publicly.
+Pricing and detector configuration changes remain disabled by default. If enabled remotely, they
+separately require `CONFIG_MUTATIONS_AUTH_TOKEN`; the live-run token does not authorize configuration
+changes.
+
+The server advertises only configured provider models. Current adapter defaults are OpenAI
+`gpt-4o-mini`, Anthropic `claude-3-5-haiku-latest`, and the Gemini model in `DEFAULT_MODEL`
+(`gemini-flash-lite-latest` by default); `OPENAI_MODEL` and `ANTHROPIC_MODEL` can set the configured
+model per provider. A request may select only that model. Calls have a 30-second HTTP timeout, an
+8,000-character prompt limit, a 1,024-token output cap, and at most one concurrent provider call
+per application process. There are no automatic retries, arbitrary tools, cross-worker concurrency
+limits, or cancellation controls. A server process restart can interrupt a run; the session event
+is persisted first so partial evidence remains inspectable.
+
+Token counts are recorded only when returned by the provider. Costs are locally estimated from
+configured model rates when all required token counts and rates exist; otherwise cost is
+unavailable. Agent Replay does not receive provider-confirmed billing totals. Common API-key and
+bearer-token text is redacted from the stored prompt/output evidence; avoid submitting private
+information or secrets. The provider response itself is returned to the requesting user.
+
 ---
 
 ## 🌐 Interactive Timeline Web UI
@@ -263,11 +306,12 @@ Open your browser to: **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
   estimates, not provider-confirmed bills; missing usage or pricing remains unavailable.
 - **AI Playground**: Exercise configured OpenAI, Anthropic, or Gemini adapters from the server,
   with each submitted run recorded as its own session and failed provider calls recorded as failed
-  events. Provider keys stay server-side. Recorded session outputs can also be evaluated without
-  making a provider call.
-- **Live Monitor / Run**: Refresh the configured server's recorded-session list periodically.
-  This is not a stream of per-event state and does not imply that an agent is currently running.
-  Scenario execution remains disabled unless `LIVE_RUN_ENABLED` is explicitly enabled.
+  events. Calls are bounded, server-side keys are never sent to the browser, and remote provider
+  requests require `LIVE_RUN_AUTH_TOKEN`.
+- **Live Monitor / Run**: Refreshes persisted sessions and live model-run state. An explicitly
+  submitted model-only call is recorded incrementally and can be inspected/evaluated in its session.
+  The monitor does not stream provider tokens. Fixed demo scenarios remain available only when
+  `LIVE_RUN_ENABLED` is enabled and remote requests pass the same token check.
 - **Navigation**: A collapsible sidebar selects one workspace view at a time; the selected session
   remains available as shared context and the session list is shown on Traces.
 
@@ -280,6 +324,12 @@ TURSO_DATABASE_URL
 TURSO_AUTH_TOKEN
 GEMINI_API_KEY
 DEFAULT_MODEL
+OPENAI_API_KEY
+OPENAI_MODEL
+ANTHROPIC_API_KEY
+ANTHROPIC_MODEL
+LIVE_RUN_AUTH_TOKEN
+CONFIG_MUTATIONS_AUTH_TOKEN
 USD_TO_INR
 LIVE_RUN_ENABLED
 CONFIG_MUTATIONS_ENABLED
@@ -287,12 +337,12 @@ CONFIG_MUTATIONS_ENABLED
 
 Import `Deep1067/CS26048-AgentReplay` into Vercel with the repository root as the project directory. The first application startup creates the required sessions, events, and settings tables automatically. Pricing and detector settings are stored in the database when Turso is configured; local development continues to use SQLite and local configuration files.
 
-`LIVE_RUN_ENABLED` and `CONFIG_MUTATIONS_ENABLED` default to `false`. Set them to `true` only in a
-trusted local environment; the application does not use a browser-visible shared secret for
-authorization. The built-in monitor can still refresh recorded sessions and instrumented
-integrations can still record into the configured storage when scenario execution is disabled.
-Scenario execution remains limited to server-defined, step-capped workflows; this switch does not
-enable arbitrary task execution.
+`LIVE_RUN_ENABLED` and `CONFIG_MUTATIONS_ENABLED` default to `false`. Remote provider execution
+also requires `LIVE_RUN_AUTH_TOKEN`; remote pricing/detector edits separately require
+`CONFIG_MUTATIONS_AUTH_TOKEN`. Never expose provider keys in frontend configuration.
+The built-in monitor can refresh recorded sessions and instrumented integrations can still record
+into configured storage when provider execution is disabled. This setting does not enable
+arbitrary agent-graph or tool execution.
 
 ---
 

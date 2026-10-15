@@ -26,15 +26,28 @@ def cost_summary(events: list[Any]) -> tuple[float | None, str]:
 
 def token_usage_summary(events: list[Any]) -> tuple[int | None, int | None, bool]:
     model_events = [event for event in events if event.type == "model_call"]
-    if not model_events or any(
-        event.tokens_total is None and not event.tokens_in and not event.tokens_out
-        for event in model_events
-    ):
+    if not model_events:
         return None, None, False
+    event_counts = [_recorded_token_counts(event) for event in model_events]
+    input_available = all(input_count is not None for input_count, _ in event_counts)
+    output_available = all(output_count is not None for _, output_count in event_counts)
     return (
-        sum(event.tokens_in for event in model_events),
-        sum(event.tokens_out for event in model_events),
-        True,
+        sum(input_count for input_count, _ in event_counts if input_count is not None)
+        if input_available
+        else None,
+        sum(output_count for _, output_count in event_counts if output_count is not None)
+        if output_available
+        else None,
+        input_available and output_available,
+    )
+
+
+def _recorded_token_counts(event: Any) -> tuple[int | None, int | None]:
+    if event.tokens_total is not None:
+        return event.tokens_in, event.tokens_out
+    return (
+        event.tokens_in if event.tokens_in else None,
+        event.tokens_out if event.tokens_out else None,
     )
 
 
@@ -86,6 +99,20 @@ class SessionService:
             enriched_events.append(item)
 
         flags = self.detector.evaluate_session(session_id, events, self.storage)
+        model_usage = []
+        for event in model_events:
+            tokens_in, tokens_out = _recorded_token_counts(event)
+            model_usage.append(
+                {
+                    "seq": event.seq,
+                    "provider": event.provider or "unknown",
+                    "model": event.model or event.name,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "cost_usd": (event.cost_usd if event.cost_status != "unavailable" else None),
+                    "cost_status": event.cost_status,
+                }
+            )
 
         return {
             "session_id": session_id,
@@ -111,26 +138,7 @@ class SessionService:
                 "tokens": usage_available,
                 "cost": total_cost_usd is not None,
             },
-            "model_usage": [
-                {
-                    "seq": event.seq,
-                    "provider": event.provider or "unknown",
-                    "model": event.model or event.name,
-                    "tokens_in": (
-                        event.tokens_in
-                        if event.tokens_in or event.tokens_out or event.tokens_total is not None
-                        else None
-                    ),
-                    "tokens_out": (
-                        event.tokens_out
-                        if event.tokens_in or event.tokens_out or event.tokens_total is not None
-                        else None
-                    ),
-                    "cost_usd": (event.cost_usd if event.cost_status != "unavailable" else None),
-                    "cost_status": event.cost_status,
-                }
-                for event in model_events
-            ],
+            "model_usage": model_usage,
             "flags": [f.to_dict() for f in flags],
             "events": enriched_events,
         }

@@ -241,6 +241,45 @@ class SQLiteStorage:
                 )
         return event
 
+    def update_event(self, event: Event) -> Event:
+        """Update an already-persisted event, for incrementally recorded executions."""
+        with self._lock:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE events
+                    SET type = ?, name = ?, args_json = ?, result_json = ?, error = ?,
+                        error_type = ?, started_at = ?, duration_ms = ?, tokens_in = ?,
+                        tokens_out = ?, cost_usd = ?, provider = ?, model = ?, tokens_total = ?,
+                        cached_tokens = ?, cost_status = ?, cost_currency = ?
+                    WHERE session_id = ? AND seq = ?;
+                    """,
+                    (
+                        event.type,
+                        event.name,
+                        event.args_json,
+                        event.result_json,
+                        event.error,
+                        event.error_type,
+                        event.started_at,
+                        event.duration_ms,
+                        event.tokens_in,
+                        event.tokens_out,
+                        event.cost_usd,
+                        event.provider,
+                        event.model,
+                        event.tokens_total,
+                        event.cached_tokens,
+                        event.cost_status,
+                        event.cost_currency,
+                        event.session_id,
+                        event.seq,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Event {event.session_id}:{event.seq} was not found.")
+        return event
+
     def get_events(self, session_id: str) -> list[Event]:
         with self._lock:
             cursor = self._conn.execute(
@@ -357,6 +396,29 @@ class SQLiteStorage:
         except (TypeError, ValueError):
             return {}
         return metadata if isinstance(metadata, dict) else {}
+
+    def update_session_metadata(self, session_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        """Merge metadata into an existing session without replacing unrelated fields."""
+        with self._lock:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT metadata_json FROM sessions WHERE session_id = ?;",
+                    (session_id,),
+                ).fetchone()
+                if not row:
+                    raise KeyError(f"Session '{session_id}' does not exist.")
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.update(updates)
+                self._conn.execute(
+                    "UPDATE sessions SET metadata_json = ? WHERE session_id = ?;",
+                    (json.dumps(metadata), session_id),
+                )
+        return metadata
 
     def delete_session(self, session_id: str) -> None:
         with self._lock:

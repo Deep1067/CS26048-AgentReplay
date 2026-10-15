@@ -6,7 +6,8 @@ from fastapi.testclient import TestClient
 from agent_replay.api import create_app
 from agent_replay.evaluation import evaluate_session, validate_criteria
 from agent_replay.models import Event
-from agent_replay.replay.experiment import run_counterfactual_experiment
+from agent_replay.replay.experiment import _metrics, run_counterfactual_experiment
+from agent_replay.session_service import token_usage_summary
 from agent_replay.storage import SQLiteStorage
 
 
@@ -205,6 +206,34 @@ def test_deterministic_assertions_cover_values_membership_metrics_and_evidence()
     assert assertion_results[0]["evidence"] == [
         {"session_id": "assertions", "seq": 2, "type": "model_call", "name": "tool"}
     ]
+
+
+def test_missing_and_partial_token_usage_remains_unavailable_across_views():
+    missing = make_event(None, event_type="model_call")
+    partial = make_event(None, event_type="model_call", tokens_in=3)
+
+    assert token_usage_summary([missing]) == (None, None, False)
+    assert token_usage_summary([partial]) == (3, None, False)
+
+    evaluation = evaluate_session("missing-usage", [missing], {"max_tokens": 1})
+    assert evaluation["evaluators"]["efficiency"]["metrics"]["total_tokens"] == {
+        "value": None,
+        "status": "unavailable",
+    }
+
+    comparison = _metrics([missing], [partial])
+    assert comparison["tokens"]["available"] is False
+    assert comparison["tokens"]["baseline_in"] is None
+    assert comparison["tokens"]["forked_out"] is None
+
+    known_zero = make_event(
+        None,
+        event_type="model_call",
+        tokens_in=0,
+        tokens_out=0,
+        tokens_total=0,
+    )
+    assert token_usage_summary([known_zero]) == (0, 0, True)
 
 
 def test_assertions_never_pass_on_missing_data_or_incompatible_json_types():

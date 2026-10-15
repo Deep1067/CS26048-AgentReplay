@@ -14,8 +14,8 @@ class Event:
     error_type: str | None = None
     started_at: str = ""
     duration_ms: float = 0.0
-    tokens_in: int = 0
-    tokens_out: int = 0
+    tokens_in: int | None = None
+    tokens_out: int | None = None
     cost_usd: float = 0.0
     provider: str | None = None
     model: str | None = None

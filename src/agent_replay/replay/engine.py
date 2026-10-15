@@ -26,6 +26,14 @@ def _raise_recorded_error(error: str, error_type: str | None) -> None:
     raise Exception(f"{recorded_type}: {error}") from None
 
 
+def _usage_count(usage: Any, *keys: str) -> int | None:
+    for key in keys:
+        value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
 class ReplayEngine:
     """Deterministic replay engine supporting STRICT and FORKED modes."""
 
@@ -185,18 +193,15 @@ class ReplayEngine:
             res = live_fn(*fn_args, **fn_kwargs)
             duration_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-            tokens_in = 0
-            tokens_out = 0
-            if hasattr(res, "usage_metadata") and res.usage_metadata:
-                meta = res.usage_metadata
-                tokens_in = getattr(meta, "prompt_token_count", 0) or getattr(
-                    meta, "input_tokens", 0
-                )
-                tokens_out = getattr(meta, "candidates_token_count", 0) or getattr(
-                    meta, "output_tokens", 0
-                )
-
-            cost_usd = get_price_engine().calculate_cost(model_name, tokens_in, tokens_out)
+            meta = getattr(res, "usage_metadata", None)
+            tokens_in = _usage_count(meta, "input_tokens", "prompt_token_count") if meta else None
+            tokens_out = (
+                _usage_count(meta, "output_tokens", "candidates_token_count") if meta else None
+            )
+            tokens_total = (
+                tokens_in + tokens_out if tokens_in is not None and tokens_out is not None else None
+            )
+            cost_usd = get_price_engine().calculate_known_cost(model_name, tokens_in, tokens_out)
             if self.forked_session_id:
                 ev = Event(
                     session_id=self.forked_session_id,
@@ -209,7 +214,9 @@ class ReplayEngine:
                     duration_ms=duration_ms,
                     tokens_in=tokens_in,
                     tokens_out=tokens_out,
-                    cost_usd=cost_usd,
+                    tokens_total=tokens_total,
+                    cost_usd=cost_usd or 0.0,
+                    cost_status="estimated" if cost_usd is not None else "unavailable",
                 )
                 self.storage.save_event(ev)
             return res
