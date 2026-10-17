@@ -594,3 +594,24 @@ def test_standalone_strict_replay_validation_persists_attempts_and_empty_calls()
         incomplete.json()["validation_id"],
         diverged.json()["validation_id"],
     }
+
+
+def test_replay_validation_reports_empty_and_missing_sessions_without_false_passes():
+    storage = SQLiteStorage(db_path=":memory:")
+    storage.create_session("empty-trace")
+    client = TestClient(create_app(storage=storage))
+
+    empty = client.post("/api/sessions/empty-trace/replay-validations", json={})
+    missing = client.post("/api/sessions/missing-trace/replay-validations", json={})
+
+    assert empty.status_code == 200
+    assert empty.json()["status"] == "unavailable"
+    assert empty.json()["result"]["status"] == "unavailable"
+    assert "no recorded events" in empty.json()["result"]["explanation"]
+    assert missing.status_code == 404
+    assert (
+        client.get("/api/sessions/empty-trace/replay-validations").json()["validations"][0][
+            "status"
+        ]
+        == "unavailable"
+    )

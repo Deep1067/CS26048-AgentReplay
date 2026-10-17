@@ -1,10 +1,13 @@
 document.addEventListener("DOMContentLoaded", () => {
   let allSessions = [];
   let currentSessionData = null;
+  let replayGuideSession = null;
+  let replayGuideBaseline = null;
   let currentExperimentId = null;
   let currentEvaluationSuite = null;
   let evaluationSuites = [];
   let latestEvaluationSuites = [];
+  let experimentBaselinesLoad = Promise.resolve();
   let loadExperimentEvaluations = null;
   let loadSessionEvaluationHistory = null;
   let currentFilter = "all";
@@ -34,6 +37,21 @@ document.addEventListener("DOMContentLoaded", () => {
   const flagsContainerEl = document.getElementById("flags-container");
   const timelineEventsEl = document.getElementById("timeline-events");
   const replaySessionSelect = document.getElementById("replay-session-select");
+  const replayGuideSessionSelect = document.getElementById("replay-guide-session");
+  const replayGuideSessionStatus = document.getElementById("replay-guide-session-status");
+  const replayGuideOpenTrace = document.getElementById("replay-guide-open-trace");
+  const replayGuideValidate = document.getElementById("replay-guide-validate");
+  const replayGuideValidationResult = document.getElementById("replay-guide-validation-result");
+  const replayGuideValidationHistory = document.getElementById("replay-guide-validation-history");
+  const replayGuideEventSelect = document.getElementById("replay-guide-event");
+  const replayGuideRecordedValue = document.getElementById("replay-guide-recorded-value");
+  const replayGuideSubstitute = document.getElementById("replay-guide-substitute");
+  const replayGuideForkExplanation = document.getElementById("replay-guide-fork-explanation");
+  const replayGuideRunFork = document.getElementById("replay-guide-run-fork");
+  const replayGuideForkStatus = document.getElementById("replay-guide-fork-status");
+  const replayGuideEvaluateSession = document.getElementById("replay-guide-evaluate-session");
+  const replayGuideOpenExperiments = document.getElementById("replay-guide-open-experiments");
+  const replayGuideOpenReplay = document.getElementById("replay-guide-open-replay");
   const replayModeSelect = document.getElementById("replay-mode-select");
   const runReplayBtn = document.getElementById("run-replay-btn");
   const replayResultsEl = document.getElementById("replay-results");
@@ -129,7 +147,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function switchTab(tabName) {
-    const validTabs = new Set(["overview", "timeline", "replay", "experiment", "live", "cost", "detector", "playground"]);
+    const validTabs = new Set(["overview", "timeline", "replay-guide", "replay", "experiment", "live", "cost", "detector", "playground"]);
     if (!validTabs.has(tabName)) tabName = "overview";
     tabBtns.forEach(btn => {
       const isActive = btn.dataset.tab === tabName;
@@ -606,7 +624,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (tabName === "playground") fetchEvaluationSuites();
     if (tabName === "experiment") {
       fetchEvaluationSuites();
-      fetchExperimentBaselines();
+      experimentBaselinesLoad = fetchExperimentBaselines();
       fetchExperimentHistory();
     }
     if (tabName === "cost") {
@@ -1024,6 +1042,215 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  function populateReplayGuide(sessions) {
+    const previousSelection = replayGuideSessionSelect.value;
+    replayGuideSessionSelect.replaceChildren();
+    if (!sessions.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "No recorded sessions";
+      replayGuideSessionSelect.appendChild(option);
+      refreshReplayGuide();
+      return;
+    }
+    sessions.forEach(session => {
+      const option = document.createElement("option");
+      option.value = session.session_id;
+      option.textContent = `${session.session_id} · ${session.event_count} events`;
+      replayGuideSessionSelect.appendChild(option);
+    });
+    const selected = previousSelection || currentSessionData?.session_id;
+    replayGuideSessionSelect.value = sessions.some(session => session.session_id === selected)
+      ? selected
+      : sessions[0].session_id;
+    refreshReplayGuide();
+  }
+
+  function renderReplayGuideValidation(validation) {
+    const result = document.createElement("pre");
+    result.className = "code-block";
+    result.textContent = JSON.stringify(validation, null, 2);
+    replayGuideValidationResult.replaceChildren(result);
+  }
+
+  async function loadReplayGuideValidationHistory(sessionId) {
+    replayGuideValidationHistory.replaceChildren();
+    if (!sessionId) {
+      replayGuideValidationHistory.textContent = "Select a session to inspect its saved validations.";
+      return;
+    }
+    try {
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/replay-validations`
+      );
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Unable to load replay validation history.");
+      if (!data.validations.length) {
+        replayGuideValidationHistory.textContent = "No saved validation attempts for this session.";
+        return;
+      }
+      data.validations.forEach(validation => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "overview-session";
+        button.textContent = `${validation.validated_at || "Time unavailable"} · ${validation.status}`;
+        button.addEventListener("click", () => renderReplayGuideValidation(validation));
+        replayGuideValidationHistory.appendChild(button);
+      });
+    } catch (err) {
+      replayGuideValidationHistory.textContent =
+        `Unable to load validation history: ${err.message}`;
+    }
+  }
+
+  async function refreshReplayGuide() {
+    const sessionId = replayGuideSessionSelect.value;
+    replayGuideSession = null;
+    replayGuideBaseline = null;
+    replayGuideEventSelect.replaceChildren();
+    replayGuideEventSelect.disabled = true;
+    replayGuideOpenTrace.disabled = !sessionId;
+    replayGuideValidate.disabled = true;
+    replayGuideEvaluateSession.disabled = true;
+    replayGuideRunFork.disabled = true;
+    replayGuideRecordedValue.textContent = "Unavailable";
+    const emptyResult = document.createElement("p");
+    emptyResult.className = "text-muted";
+    emptyResult.textContent = "No validation run from this guide yet.";
+    replayGuideValidationResult.replaceChildren(emptyResult);
+    replayGuideForkStatus.textContent =
+      "A supported baseline is required before a fork can be created.";
+    replayGuideSessionStatus.textContent = sessionId
+      ? "Loading session and operation eligibility..."
+      : "No recorded session is available. Record or load a session first.";
+    loadReplayGuideValidationHistory(sessionId);
+    if (!sessionId) return;
+
+    try {
+      const [sessionResponse, baselineResponse] = await Promise.all([
+        fetch(`/api/sessions/${encodeURIComponent(sessionId)}`),
+        fetch("/api/experiments/baselines"),
+      ]);
+      const sessionData = await sessionResponse.json();
+      const baselineData = await baselineResponse.json();
+      if (!sessionResponse.ok) {
+        throw new Error(sessionData.detail || "Unable to load the selected session.");
+      }
+      if (!baselineResponse.ok) {
+        throw new Error(baselineData.detail || "Unable to check fork eligibility.");
+      }
+      replayGuideSession = sessionData;
+      const events = Array.isArray(sessionData.events) ? sessionData.events : [];
+      const eventErrorCount = events.filter(event => event.error || event.error_type).length;
+      replayGuideValidate.disabled = events.length === 0;
+      replayGuideEvaluateSession.disabled = events.length === 0;
+      replayGuideSessionStatus.textContent =
+        [
+          `${sessionId} · ${events.length} persisted event(s)`,
+          `event-level error fields: ${eventErrorCount} (inspect result payloads too)`,
+          events.length
+            ? "inspect event details in the ordered Traces timeline."
+            : "no trace evidence to validate.",
+        ].join(" · ");
+      const eligible = baselineData.baselines.find(
+        baseline => baseline.session_id === sessionId
+      );
+      if (!eligible) {
+        replayGuideForkExplanation.textContent =
+          "This session is not eligible for the current guided fork. Forks support the recorded scenario-2 account workflow and substitution of its first tool response only.";
+        replayGuideForkStatus.textContent =
+          "Fork unavailable for this session; the server will enforce eligibility.";
+      } else {
+        replayGuideBaseline = eligible;
+        replayGuideForkExplanation.textContent =
+          "This session is eligible for controlled substitution. The current workflow exposes only the recorded first tool response; the server validates the replacement and preserves this baseline.";
+        eligible.substitutable_events.forEach(event => {
+          const option = document.createElement("option");
+          option.value = String(event.seq);
+          option.textContent = `#${event.seq} ${event.type}: ${event.name}`;
+          replayGuideEventSelect.appendChild(option);
+        });
+        replayGuideEventSelect.disabled = !eligible.substitutable_events.length;
+        replayGuideRunFork.disabled = !eligible.substitutable_events.length;
+        replayGuideForkStatus.textContent = eligible.substitutable_events.length
+          ? "Eligible controlled substitution available. Review the recorded value and explicitly create a fork when ready."
+          : "The session matched the baseline rules but has no eligible substitution event.";
+        showReplayGuideRecordedValue();
+      }
+      await loadReplayGuideValidationHistory(sessionId);
+    } catch (err) {
+      replayGuideSessionStatus.textContent = `Unable to load guide context: ${err.message}`;
+      replayGuideForkExplanation.textContent =
+        "Fork eligibility could not be checked. No fork action is available until session data loads.";
+      replayGuideRunFork.disabled = true;
+    }
+  }
+
+  function showReplayGuideRecordedValue() {
+    const event = replayGuideBaseline?.substitutable_events.find(
+      item => item.seq === Number(replayGuideEventSelect.value)
+    );
+    replayGuideRecordedValue.textContent = event
+      ? JSON.stringify(event.recorded_result, null, 2)
+      : "Unavailable";
+  }
+
+  async function runReplayGuideValidation() {
+    const sessionId = replayGuideSessionSelect.value;
+    if (!sessionId || !replayGuideSession?.events?.length) {
+      replayGuideValidationResult.textContent =
+        "Strict validation is unavailable because this session has no recorded events.";
+      return;
+    }
+    replayGuideValidate.disabled = true;
+    replayGuideValidationResult.textContent =
+      "Validating recorded events only; no agent or provider will be executed...";
+    try {
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/replay-validations`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      );
+      const validation = await response.json();
+      if (!response.ok) {
+        throw new Error(validation.detail || "Strict replay validation failed.");
+      }
+      renderReplayGuideValidation(validation);
+      await loadReplayGuideValidationHistory(sessionId);
+    } catch (err) {
+      replayGuideValidationResult.textContent =
+        `Strict replay validation failed: ${err.message}`;
+    } finally {
+      replayGuideValidate.disabled = !replayGuideSession?.events?.length;
+    }
+  }
+
+  async function runReplayGuideFork() {
+    if (!replayGuideBaseline || !replayGuideEventSelect.value) {
+      replayGuideForkStatus.textContent =
+        "Fork unavailable: select a session with an eligible substitution event.";
+      return;
+    }
+    let substituteResult;
+    try {
+      substituteResult = JSON.parse(replayGuideSubstitute.value);
+    } catch (_) {
+      replayGuideForkStatus.textContent =
+        "Replacement response must be valid JSON. No fork was started.";
+      return;
+    }
+    switchTab("experiment");
+    await experimentBaselinesLoad;
+    experimentBaselineSelect.value = replayGuideBaseline.session_id;
+    updateExperimentEventOptions();
+    experimentEventSelect.value = replayGuideEventSelect.value;
+    experimentResultInput.value = JSON.stringify(substituteResult, null, 2);
+    replayGuideForkStatus.textContent = "Creating the controlled fork using the existing experiment workflow...";
+    const result = await runExperiment();
+    replayGuideForkStatus.textContent = result
+      ? `Saved comparison ${result.experiment_id}. Revisit it in Experiments; the original baseline remains recorded.`
+      : "Fork was not created. Review the validation or error shown in Experiments.";
+  }
+
   function populateReplaySessions(sessions) {
     replaySessionSelect.replaceChildren();
     sessions.forEach(session => {
@@ -1360,10 +1587,12 @@ document.addEventListener("DOMContentLoaded", () => {
         "Comparison created. Evaluate both recorded outputs with the criteria above.";
       await fetchSessions();
       await fetchExperimentHistory();
+      return data;
     } catch (err) {
       const message =
         err.name === "AbortError" ? "The experiment timed out." : err.message;
       experimentResultsEl.textContent = `Experiment failed: ${message}`;
+      return null;
     } finally {
       window.clearTimeout(timeoutId);
       runExperimentBtn.disabled = false;
@@ -1378,6 +1607,7 @@ document.addEventListener("DOMContentLoaded", () => {
       allSessions = await res.json();
       sessionCountBadge.textContent = `${allSessions.length} Sessions`;
       populateReplaySessions(allSessions);
+      populateReplayGuide(allSessions);
       populateEvaluationSessions(allSessions);
       renderSessionsList(allSessions);
     } catch (err) {
@@ -1432,6 +1662,10 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!res.ok) throw new Error("Failed to load session details");
       currentSessionData = await res.json();
       replaySessionSelect.value = sessionId;
+      if ([...replayGuideSessionSelect.options].some(option => option.value === sessionId)) {
+        replayGuideSessionSelect.value = sessionId;
+        refreshReplayGuide();
+      }
       fetchReplayValidationHistory(sessionId);
       if ([...playgroundEvaluationSession.options].some(option => option.value === sessionId)) {
         playgroundEvaluationSession.value = sessionId;
@@ -1447,8 +1681,10 @@ document.addEventListener("DOMContentLoaded", () => {
       renderFlags(currentSessionData.flags || []);
       renderTimeline(currentSessionData.events || [], currentSessionData.flags || []);
       renderSessionsList(allSessions);
+      return true;
     } catch (err) {
       alert("Error loading session: " + err.message);
+      return false;
     }
   }
 
@@ -1913,6 +2149,33 @@ document.addEventListener("DOMContentLoaded", () => {
 
   runReplayBtn.addEventListener("click", () => runReplay());
   replaySessionSelect.addEventListener("change", () => {
+    fetchReplayValidationHistory(replaySessionSelect.value);
+  });
+  replayGuideSessionSelect.addEventListener("change", refreshReplayGuide);
+  replayGuideEventSelect.addEventListener("change", showReplayGuideRecordedValue);
+  replayGuideOpenTrace.addEventListener("click", async () => {
+    const selected = await selectSession(replayGuideSessionSelect.value);
+    if (selected) switchTab("timeline");
+  });
+  replayGuideValidate.addEventListener("click", runReplayGuideValidation);
+  replayGuideRunFork.addEventListener("click", runReplayGuideFork);
+  replayGuideEvaluateSession.addEventListener("click", () => {
+    const sessionId = replayGuideSessionSelect.value;
+    if (![...playgroundEvaluationSession.options].some(option => option.value === sessionId)) {
+      replayGuideSessionStatus.textContent =
+        "This session is no longer available in the recorded-output evaluator. Refresh the session list and try again.";
+      return;
+    }
+    playgroundEvaluationSession.value = sessionId;
+    switchTab("playground");
+  });
+  replayGuideOpenExperiments.addEventListener("click", async () => {
+    switchTab("experiment");
+    await fetchExperimentHistory();
+  });
+  replayGuideOpenReplay.addEventListener("click", () => {
+    replaySessionSelect.value = replayGuideSessionSelect.value;
+    switchTab("replay");
     fetchReplayValidationHistory(replaySessionSelect.value);
   });
   if (runExperimentBtn) {

@@ -392,6 +392,25 @@ body {
   font-size: 18px;
 }
 
+.replay-guide {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 100%;
+}
+.guide-step {
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding-top: 16px;
+}
+.guide-step h3 { font-size: 15px; }
+.guide-step .control-group { max-width: 760px; width: 100%; }
+.guide-value .code-block { margin: 0; max-width: 100%; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.guide-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
 .replay-toolbar {
   display: flex;
   align-items: end;

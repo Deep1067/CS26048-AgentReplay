@@ -35,6 +35,7 @@
       <nav class="sidebar-nav" aria-label="Primary navigation">
         <button class="sidebar-link active" data-tab="overview"><span>⌂</span><b>Overview</b></button>
         <button class="sidebar-link" data-tab="timeline"><span>◌</span><b>Traces</b></button>
+        <button class="sidebar-link" data-tab="replay-guide"><span>◇</span><b>Replay Guide</b></button>
         <button class="sidebar-link" data-tab="replay"><span>↪</span><b>Replay</b></button>
         <button class="sidebar-link" data-tab="experiment"><span>◇</span><b>Experiments</b></button>
         <button class="sidebar-link" data-tab="cost"><span>$</span><b>Usage & Costs</b></button>
@@ -192,6 +193,99 @@
             <textarea id="playground-prompt" class="prompt-input" rows="4" placeholder="Ask a configured provider..." required></textarea>
             <div class="playground-actions"><button id="playground-send" class="btn btn-primary" type="submit">Send</button><button id="playground-reset" class="btn btn-secondary" type="button">Reset</button></div>
           </form>
+        </div>
+      </section>
+
+      <section id="tab-replay-guide" class="tab-panel" data-panel="replay-guide" hidden>
+        <div class="panel-card replay-guide">
+          <h2>Replay Guide</h2>
+          <p class="text-muted">
+            Work from recorded evidence: inspect a trace, validate its recorded call sequence,
+            or create a supported controlled fork. Strict validation does not re-run an agent;
+            forks only substitute eligible recorded tool responses.
+          </p>
+
+          <section class="guide-step">
+            <h3>1. Select a recorded session</h3>
+            <label class="control-group">
+              <span class="metric-label">Session</span>
+              <select id="replay-guide-session" class="select-input" aria-label="Replay Guide session"></select>
+            </label>
+            <div id="replay-guide-session-status" class="notice-panel" aria-live="polite">
+              Loading recorded sessions...
+            </div>
+            <button id="replay-guide-open-trace" class="btn btn-secondary" type="button" disabled>
+              Inspect ordered trace
+            </button>
+          </section>
+
+          <section class="guide-step">
+            <h3>2. Validate the recorded sequence</h3>
+            <p class="text-muted">
+              Strict replay checks the recorded event sequence and arguments against persisted
+              results. It does not call a provider or execute the agent again.
+            </p>
+            <button id="replay-guide-validate" class="btn btn-primary" type="button" disabled>
+              Validate recorded replay
+            </button>
+            <div id="replay-guide-validation-result" class="replay-results" aria-live="polite">
+              <p class="text-muted">No validation run from this guide yet.</p>
+            </div>
+            <h4 class="section-heading">Saved validation history</h4>
+            <div id="replay-guide-validation-history" class="experiment-history">
+              <p class="text-muted">Select a session to inspect its saved validations.</p>
+            </div>
+          </section>
+
+          <section class="guide-step">
+            <h3>3. Configure a controlled fork</h3>
+            <p id="replay-guide-fork-explanation" class="text-muted">
+              Forking is limited to a supported recorded account workflow and its eligible event.
+              The baseline remains unchanged.
+            </p>
+            <label class="control-group">
+              <span class="metric-label">Eligible substitution event</span>
+              <select id="replay-guide-event" class="select-input" disabled></select>
+            </label>
+            <label class="control-group guide-value">
+              <span class="metric-label">Recorded event result</span>
+              <pre id="replay-guide-recorded-value" class="code-block">Unavailable</pre>
+            </label>
+            <label class="control-group guide-value">
+              <span class="metric-label">Proposed replacement result (JSON)</span>
+              <textarea id="replay-guide-substitute" class="prompt-input" rows="4">{"status":"ok","balance":500.0}</textarea>
+            </label>
+            <p class="text-muted">
+              The server validates the replacement. The fork reuses the existing controlled
+              scenario workflow; it is not arbitrary agent-graph execution.
+            </p>
+            <button id="replay-guide-run-fork" class="btn btn-primary" type="button" disabled>
+              Create and compare fork
+            </button>
+            <div id="replay-guide-fork-status" class="notice-panel" aria-live="polite">
+              A supported baseline is required before a fork can be created.
+            </div>
+          </section>
+
+          <section class="guide-step">
+            <h3>4. Review and revisit results</h3>
+            <p class="text-muted">
+              Compare saved baseline and fork evidence in Experiments. Evaluation suites and
+              criterion-level evidence are available there when you evaluate a saved comparison.
+              Unrecorded usage or cost remains unavailable.
+            </p>
+            <div class="guide-actions">
+              <button id="replay-guide-evaluate-session" class="btn btn-secondary" type="button" disabled>
+                Evaluate selected recorded session
+              </button>
+              <button id="replay-guide-open-experiments" class="btn btn-secondary" type="button">
+                Open saved comparisons and evaluations
+              </button>
+              <button id="replay-guide-open-replay" class="btn btn-secondary" type="button">
+                Open replay validation history
+              </button>
+            </div>
+          </section>
         </div>
       </section>
 

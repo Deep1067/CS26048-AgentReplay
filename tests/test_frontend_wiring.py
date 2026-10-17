@@ -80,3 +80,41 @@ def test_live_model_run_form_polls_persisted_runs_and_links_to_sessions():
     assert "async function launchLiveModelRun()" in source
     assert "fetch(`/api/live/runs/${encodeURIComponent(created.run_id)}`)" in source
     assert 'launchLiveModelBtn.addEventListener("click", launchLiveModelRun)' in source
+
+
+def test_replay_guide_actions_use_existing_trace_replay_and_experiment_workflows():
+    html = APP_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    for element_id in (
+        "replay-guide-session",
+        "replay-guide-session-status",
+        "replay-guide-open-trace",
+        "replay-guide-validate",
+        "replay-guide-validation-history",
+        "replay-guide-event",
+        "replay-guide-recorded-value",
+        "replay-guide-substitute",
+        "replay-guide-run-fork",
+        "replay-guide-evaluate-session",
+        "replay-guide-open-experiments",
+        "replay-guide-open-replay",
+    ):
+        assert f'id="{element_id}"' in html
+    assert 'data-tab="replay-guide"' in html
+    assert 'data-panel="replay-guide"' in html
+    assert 'new Set(["overview", "timeline", "replay-guide"' in source
+    assert "populateReplayGuide(allSessions)" in source
+    assert 'fetch("/api/experiments/baselines")' in source
+    assert "/api/sessions/${encodeURIComponent(sessionId)}/replay-validations" in source
+    assert "selectSession(replayGuideSessionSelect.value)" in source
+    assert 'switchTab("timeline")' in source
+    assert 'switchTab("replay")' in source
+    assert 'switchTab("experiment")' in source
+    assert 'switchTab("playground")' in source
+    assert "const result = await runExperiment();" in source
+    assert "await experimentBaselinesLoad" in source
+    assert 'replayGuideRunFork.addEventListener("click", runReplayGuideFork)' in source
+    assert ".replay-guide" in css
+    assert ".guide-actions { display: flex; flex-wrap: wrap;" in css

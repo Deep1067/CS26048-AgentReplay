@@ -279,6 +279,23 @@ unavailable. Agent Replay does not receive provider-confirmed billing totals. Co
 bearer-token text is redacted from the stored prompt/output evidence; avoid submitting private
 information or secrets. The provider response itself is returned to the requesting user.
 
+### Phase 5: Replay Guide
+
+The Replay Guide connects an existing recorded session to the existing trace timeline, strict
+replay-validation API, and guided experiment workflow. It reports whether the selected session
+matches the current supported fork workflow and shows the recorded value for each eligible
+substitution before the user explicitly starts a fork. The server remains authoritative for
+substitution validation; the original baseline is retained.
+
+Strict validation checks the recorded sequence and persisted results; it does not execute an
+agent or make provider calls. A guided fork uses the existing controlled scenario workflow and
+currently supports only the first account-lookup tool response for eligible scenario-2 sessions.
+Saved validation attempts and experiment comparisons remain in their existing histories. Open a
+session in the recorded-output evaluator or open a saved comparison in Experiments to inspect its
+baseline/fork evidence and apply an evaluation suite. The guide does not create a second trace
+viewer, replay engine, evaluation path, or history store. Unsupported sessions, empty traces, and
+missing data are reported as ineligible or unavailable rather than being treated as successful.
+
 ---
 
 ## 🌐 Interactive Timeline Web UI

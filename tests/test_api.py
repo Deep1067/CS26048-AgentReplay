@@ -327,6 +327,7 @@ def test_api_guided_experiment_persists_selected_baseline_and_comparison():
         )
     )
     test_client = TestClient(create_app(storage=storage))
+    original_baseline_event = storage.get_events("recorded-account-run")[0].to_dict()
 
     baselines = test_client.get("/api/experiments/baselines").json()["baselines"]
     assert baselines[0]["session_id"] == "recorded-account-run"
@@ -355,6 +356,7 @@ def test_api_guided_experiment_persists_selected_baseline_and_comparison():
     saved = test_client.get(f"/api/experiments/{comparison['experiment_id']}")
     assert saved.status_code == 200
     assert saved.json()["result"]["events"] == comparison["events"]
+    assert storage.get_events("recorded-account-run")[0].to_dict() == original_baseline_event
     assert (
         test_client.get("/api/experiments").json()["experiments"][0]["baseline_session_id"]
         == "recorded-account-run"
@@ -645,6 +647,57 @@ def test_live_model_run_persists_incrementally_and_can_be_evaluated(monkeypatch)
     )
     assert evaluation.status_code == 200
     assert evaluation.json()["result"]["status"] == "passed"
+
+
+def test_live_model_run_enforces_single_process_concurrency(monkeypatch):
+    import threading
+
+    monkeypatch.setenv("OPENAI_API_KEY", "server-only-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "mock-live-model")
+    storage = SQLiteStorage(db_path=":memory:")
+    app = create_app(storage=storage, live_run_enabled=True)
+    client = TestClient(app)
+    provider_started = threading.Event()
+    finish_provider = threading.Event()
+    first_response = []
+
+    def blocking_provider(provider, prompt, model):
+        provider_started.set()
+        if not finish_provider.wait(timeout=5):
+            raise RuntimeError("Mock provider timed out.")
+        return ProviderResponse("done", provider, model)
+
+    monkeypatch.setattr("agent_replay.api.call_provider", blocking_provider)
+    first_request = threading.Thread(
+        target=lambda: first_response.append(
+            client.post(
+                "/api/live/runs",
+                json={"provider": "openai", "model": "mock-live-model", "prompt": "first"},
+            )
+        )
+    )
+    first_request.start()
+    try:
+        assert provider_started.wait(timeout=5)
+        running = storage.list_sessions()
+        assert len(running) == 1
+        run_id = running[0].session_id
+        assert storage.get_session_metadata(run_id)["run_status"] == "running"
+        assert len(storage.get_events(run_id)) == 1
+
+        rejected = client.post(
+            "/api/live/runs",
+            json={"provider": "openai", "model": "mock-live-model", "prompt": "second"},
+        )
+        assert rejected.status_code == 429
+        assert "already running" in rejected.json()["detail"]
+    finally:
+        finish_provider.set()
+        first_request.join(timeout=5)
+
+    assert not first_request.is_alive()
+    assert first_response[0].status_code == 202
+    assert storage.get_session_metadata(run_id)["run_status"] == "completed"
 
 
 def test_live_model_provider_failure_is_persisted_as_failed(monkeypatch):

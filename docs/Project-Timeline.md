@@ -15,6 +15,7 @@
 | Phase 2 | Deterministic configurable evaluation of recorded session outputs and persisted baseline/fork comparisons, with evidence, versioning, and append-only history |
 | Phase 3 | Reusable versioned evaluation suites, safe deterministic assertions, suite-based experiment comparisons, and persisted strict replay validation history |
 | Phase 4 | Bounded, authenticated-when-remote, model-only live runs with incremental session events, persistent run status, configured-model selection, and provider-adapter hardening |
+| Phase 5 | Replay Guide connecting recorded traces, persisted strict validation, and supported controlled forks through existing workflows |
 
 ## Current status
 
@@ -93,3 +94,20 @@ The local implementation is functional and validated by the automated test suite
 - No real provider call, deployment, or browser automation is claimed as part of this phase.
   Remote deployment configuration must keep `LIVE_RUN_ENABLED` off unless the separate auth token
   is installed and protected.
+
+## Phase 5 Replay Guide
+
+- The Replay Guide selects from persisted sessions, reports current fork eligibility, and routes
+  trace inspection to the existing ordered Traces timeline.
+- Strict validation submits to the existing replay-validation endpoint and renders its saved
+  evidence and validation history. It validates recorded calls and responses; it does not rerun
+  an agent or call a provider.
+- For eligible scenario-2 account workflows, the guide shows the recorded first tool response,
+  accepts an explicit JSON replacement, and invokes the existing guided experiment operation.
+  Server-side validation remains authoritative and the baseline session is not modified.
+- Saved validation history and experiment/evaluation history remain accessible from the existing
+  Replay and Experiments sections. Session evaluation routes to the existing Playground recorded-
+  output evaluator. No duplicate replay engine, trace viewer, evaluator, or persistence store was
+  introduced.
+- Fork support remains intentionally limited to the recorded account workflow. Arbitrary graph
+  replay, additional substitution points, and live model execution remain separate capabilities.
