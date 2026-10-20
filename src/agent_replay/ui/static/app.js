@@ -160,7 +160,15 @@ document.addEventListener("DOMContentLoaded", () => {
       panel.classList.toggle("active", isActive);
       panel.hidden = !isActive;
     });
-    sidebarLinks.forEach(link => link.classList.toggle("active", link.dataset.tab === tabName));
+    sidebarLinks.forEach(link => {
+      const isActive = link.dataset.tab === tabName;
+      link.classList.toggle("active", isActive);
+      if (isActive) {
+        link.setAttribute("aria-current", "page");
+      } else {
+        link.removeAttribute("aria-current");
+      }
+    });
     sessionsSidebar.classList.toggle("hidden", tabName !== "timeline");
     sessionContext.textContent = currentSessionData
       ? `Session: ${currentSessionData.session_id}`
@@ -169,6 +177,7 @@ document.addEventListener("DOMContentLoaded", () => {
     window.localStorage.setItem("agent-replay-section", tabName);
     if (window.matchMedia("(max-width: 850px)").matches) {
       sidebar.classList.remove("mobile-open");
+      sidebar.inert = true;
       sidebarOverlay.hidden = true;
       mobileNavToggle.setAttribute("aria-expanded", "false");
       mobileNavToggle.setAttribute("aria-label", "Open navigation");
@@ -863,21 +872,44 @@ document.addEventListener("DOMContentLoaded", () => {
       toggleMobileNavigation();
     } else {
       sidebar.classList.toggle("collapsed");
-      window.localStorage.setItem("agent-replay-sidebar-collapsed", String(sidebar.classList.contains("collapsed")));
+      const isCollapsed = sidebar.classList.contains("collapsed");
+      sidebarToggle.setAttribute("aria-expanded", String(!isCollapsed));
+      sidebarToggle.setAttribute("aria-label", isCollapsed ? "Expand navigation" : "Collapse navigation");
+      window.localStorage.setItem("agent-replay-sidebar-collapsed", String(isCollapsed));
     }
   });
   function toggleMobileNavigation() {
     const isOpen = sidebar.classList.toggle("mobile-open");
+    sidebar.inert = !isOpen;
     sidebarOverlay.hidden = !isOpen;
     mobileNavToggle.setAttribute("aria-expanded", String(isOpen));
     mobileNavToggle.setAttribute("aria-label", isOpen ? "Close navigation" : "Open navigation");
+    if (!isOpen) mobileNavToggle.focus();
   }
   mobileNavToggle.addEventListener("click", toggleMobileNavigation);
   sidebarOverlay.addEventListener("click", () => {
     sidebar.classList.remove("mobile-open");
+    sidebar.inert = true;
     sidebarOverlay.hidden = true;
     mobileNavToggle.setAttribute("aria-expanded", "false");
     mobileNavToggle.setAttribute("aria-label", "Open navigation");
+    mobileNavToggle.focus();
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && sidebar.classList.contains("mobile-open")) {
+      toggleMobileNavigation();
+    }
+  });
+  window.addEventListener("resize", () => {
+    const isMobile = window.matchMedia("(max-width: 850px)").matches;
+    const isOpen = sidebar.classList.contains("mobile-open");
+    sidebar.inert = isMobile && !isOpen;
+    if (!isMobile) {
+      sidebar.classList.remove("mobile-open");
+      sidebarOverlay.hidden = true;
+      mobileNavToggle.setAttribute("aria-expanded", "false");
+      mobileNavToggle.setAttribute("aria-label", "Open navigation");
+    }
   });
   sidebarLinks.forEach(link => link.addEventListener("click", () => switchTab(link.dataset.tab)));
 
@@ -2117,6 +2149,10 @@ document.addEventListener("DOMContentLoaded", () => {
     "collapsed",
     window.localStorage.getItem("agent-replay-sidebar-collapsed") === "true"
   );
+  const sidebarIsCollapsed = sidebar.classList.contains("collapsed");
+  sidebarToggle.setAttribute("aria-expanded", String(!sidebarIsCollapsed));
+  sidebarToggle.setAttribute("aria-label", sidebarIsCollapsed ? "Expand navigation" : "Collapse navigation");
+  sidebar.inert = window.matchMedia("(max-width: 850px)").matches;
   experimentBaselineSelect.addEventListener("change", updateExperimentEventOptions);
   [usageProviderFilter, usageModelFilter, usageSessionFilter].forEach(filter => {
     filter.addEventListener("change", () => {

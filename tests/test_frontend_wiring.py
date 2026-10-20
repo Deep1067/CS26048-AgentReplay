@@ -33,6 +33,19 @@ def test_mobile_navigation_has_an_accessible_header_toggle():
     assert "#session-count-badge { display: none; }" in css
     assert 'mobileNavToggle.addEventListener("click", toggleMobileNavigation)' in source
     assert 'mobileNavToggle.setAttribute("aria-expanded", "false")' in source
+    assert "sidebar.inert = !isOpen" in source
+    assert 'event.key === "Escape"' in source
+    assert 'link.setAttribute("aria-current", "page")' in source
+
+
+def test_visual_system_respects_focus_and_reduced_motion():
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert ":focus-visible" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    assert "var(--focus-ring)" in css
+    assert "@media (max-width: 600px)" in css
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in css
 
 
 def test_experiment_and_playground_have_recorded_output_evaluation_controls():

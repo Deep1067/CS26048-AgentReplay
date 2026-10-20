@@ -296,6 +296,19 @@ baseline/fork evidence and apply an evaluation suite. The guide does not create 
 viewer, replay engine, evaluation path, or history store. Unsupported sessions, empty traces, and
 missing data are reported as ineligible or unavailable rather than being treated as successful.
 
+### Phase 6: Visual identity and motion
+
+Phase 6 keeps the existing product behavior and strengthens the visual system around it: a more
+consistent dark design system, clearer app shell hierarchy, improved form and table styling,
+responsive navigation, stronger focus states, and restrained motion for navigation and interaction
+feedback. The aim is a more polished Agent Replay experience without altering workflow semantics,
+stored data, or replay/evaluation logic.
+
+The UI work kept the current sidebar-based workspace, session context, and per-view rendering model.
+It improved edge cases around focus visibility, mobile navigation, status chips, and dense technical
+content while preserving the working behavior of traces, replay, experiments, usage/cost views,
+Playground safety messaging, and the Live Run disabled/status reporting.
+
 ---
 
 ## 🌐 Interactive Timeline Web UI

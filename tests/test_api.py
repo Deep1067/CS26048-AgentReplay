@@ -1,5 +1,7 @@
+import asyncio
 import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -7,6 +9,37 @@ from agent_replay.api import create_app
 from agent_replay.models import Event
 from agent_replay.providers import ProviderResponse
 from agent_replay.storage import SQLiteStorage
+
+
+class _RemoteClient:
+    def __init__(self, app, host: str, port: int):
+        self._transport = httpx.ASGITransport(app=app, client=(host, port))
+        self._client = httpx.AsyncClient(transport=self._transport, base_url="http://testserver")
+
+    def request(self, method: str, url: str, **kwargs):
+        return asyncio.run(self._client.request(method, url, **kwargs))
+
+    def get(self, url: str, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url: str, **kwargs):
+        return self.request("PUT", url, **kwargs)
+
+    def close(self):
+        asyncio.run(self._client.aclose())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+def _remote_client(app, host: str, port: int):
+    return _RemoteClient(app, host, port)
 
 
 @pytest.fixture
@@ -747,8 +780,7 @@ def test_remote_provider_execution_requires_server_token(monkeypatch):
     monkeypatch.setenv("OPENAI_MODEL", "mock-live-model")
     monkeypatch.delenv("LIVE_RUN_AUTH_TOKEN", raising=False)
     app = create_app(storage=SQLiteStorage(db_path=":memory:"), live_run_enabled=True)
-    client = TestClient(app, client=("203.0.113.10", 12345))
-
+    client = _remote_client(app, "203.0.113.10", 12345)
     blocked = client.post(
         "/api/live/runs",
         json={"provider": "openai", "prompt": "task"},
@@ -767,6 +799,7 @@ def test_remote_provider_execution_requires_server_token(monkeypatch):
         headers={"Authorization": "Bearer remote-test-token"},
         json={"provider": "openai", "prompt": "task"},
     )
+    client.close()
 
     assert blocked.status_code == 503
     assert unauthorized.status_code == 401
@@ -779,7 +812,7 @@ def test_remote_configuration_mutations_require_separate_admin_token(monkeypatch
         storage=SQLiteStorage(db_path=":memory:"),
         config_mutations_enabled=True,
     )
-    client = TestClient(app, client=("203.0.113.11", 12345))
+    client = _remote_client(app, "203.0.113.11", 12345)
     original = client.get("/api/prices").json()
     update = {
         "models": {
@@ -794,13 +827,15 @@ def test_remote_configuration_mutations_require_separate_admin_token(monkeypatch
     monkeypatch.setenv("CONFIG_MUTATIONS_AUTH_TOKEN", "separate-admin-token")
     invalid_token = client.put(
         "/api/prices",
-        headers={"Authorization": "Bearer wrong-token"},
+        headers={"Authorization": "Bearer invalid-token"},
         json=update,
     )
+    final_prices = client.get("/api/prices").json()
+    client.close()
 
     assert missing_token.status_code == 503
     assert invalid_token.status_code == 401
-    assert client.get("/api/prices").json() == original
+    assert original == final_prices
 
 
 def test_api_live_run_success_and_step_cap(client):
