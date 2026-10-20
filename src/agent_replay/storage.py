@@ -104,6 +104,70 @@ class SQLiteStorage:
                         value_json TEXT NOT NULL
                     );
                 """)
+                self._conn.execute("""
+                    CREATE TABLE IF NOT EXISTS experiments (
+                        experiment_id TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        baseline_session_id TEXT NOT NULL,
+                        fork_session_id TEXT NOT NULL,
+                        result_json TEXT NOT NULL
+                    );
+                """)
+                self._conn.execute("""
+                    CREATE TABLE IF NOT EXISTS evaluations (
+                        evaluation_id TEXT PRIMARY KEY,
+                        evaluated_at TEXT NOT NULL,
+                        target_type TEXT NOT NULL,
+                        session_id TEXT,
+                        experiment_id TEXT,
+                        criteria_json TEXT NOT NULL,
+                        result_json TEXT NOT NULL,
+                        suite_id TEXT,
+                        suite_version INTEGER
+                    );
+                """)
+                evaluation_columns = {
+                    row["name"]
+                    for row in self._conn.execute("PRAGMA table_info(evaluations);").fetchall()
+                }
+                if "suite_id" not in evaluation_columns:
+                    self._conn.execute("ALTER TABLE evaluations ADD COLUMN suite_id TEXT;")
+                if "suite_version" not in evaluation_columns:
+                    self._conn.execute("ALTER TABLE evaluations ADD COLUMN suite_version INTEGER;")
+                self._conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_evaluations_target
+                    ON evaluations (session_id, experiment_id, evaluated_at);
+                """)
+                self._conn.execute("""
+                    CREATE TABLE IF NOT EXISTS evaluation_suites (
+                        suite_id TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        criteria_json TEXT NOT NULL,
+                        evaluator_version TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (suite_id, version)
+                    );
+                """)
+                self._conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_evaluation_suites_name
+                    ON evaluation_suites (name, suite_id, version);
+                """)
+                self._conn.execute("""
+                    CREATE TABLE IF NOT EXISTS replay_validations (
+                        validation_id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        validated_at TEXT NOT NULL,
+                        validation_version TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        result_json TEXT NOT NULL
+                    );
+                """)
+                self._conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_replay_validations_session
+                    ON replay_validations (session_id, validated_at);
+                """)
 
     def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> str:
         now = datetime.now(UTC).isoformat()
@@ -175,6 +239,45 @@ class SQLiteStorage:
                         event.cost_currency,
                     ),
                 )
+        return event
+
+    def update_event(self, event: Event) -> Event:
+        """Update an already-persisted event, for incrementally recorded executions."""
+        with self._lock:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE events
+                    SET type = ?, name = ?, args_json = ?, result_json = ?, error = ?,
+                        error_type = ?, started_at = ?, duration_ms = ?, tokens_in = ?,
+                        tokens_out = ?, cost_usd = ?, provider = ?, model = ?, tokens_total = ?,
+                        cached_tokens = ?, cost_status = ?, cost_currency = ?
+                    WHERE session_id = ? AND seq = ?;
+                    """,
+                    (
+                        event.type,
+                        event.name,
+                        event.args_json,
+                        event.result_json,
+                        event.error,
+                        event.error_type,
+                        event.started_at,
+                        event.duration_ms,
+                        event.tokens_in,
+                        event.tokens_out,
+                        event.cost_usd,
+                        event.provider,
+                        event.model,
+                        event.tokens_total,
+                        event.cached_tokens,
+                        event.cost_status,
+                        event.cost_currency,
+                        event.session_id,
+                        event.seq,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Event {event.session_id}:{event.seq} was not found.")
         return event
 
     def get_events(self, session_id: str) -> list[Event]:
@@ -294,6 +397,29 @@ class SQLiteStorage:
             return {}
         return metadata if isinstance(metadata, dict) else {}
 
+    def update_session_metadata(self, session_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        """Merge metadata into an existing session without replacing unrelated fields."""
+        with self._lock:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT metadata_json FROM sessions WHERE session_id = ?;",
+                    (session_id,),
+                ).fetchone()
+                if not row:
+                    raise KeyError(f"Session '{session_id}' does not exist.")
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.update(updates)
+                self._conn.execute(
+                    "UPDATE sessions SET metadata_json = ? WHERE session_id = ?;",
+                    (json.dumps(metadata), session_id),
+                )
+        return metadata
+
     def delete_session(self, session_id: str) -> None:
         with self._lock:
             with self._conn:
@@ -322,3 +448,340 @@ class SQLiteStorage:
                     """,
                     (key, value_json),
                 )
+
+    def create_experiment(
+        self,
+        experiment_id: str,
+        baseline_session_id: str,
+        fork_session_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        created_at = datetime.now(UTC).isoformat()
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO experiments (
+                        experiment_id, created_at, baseline_session_id, fork_session_id,
+                        result_json
+                    ) VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (
+                        experiment_id,
+                        created_at,
+                        baseline_session_id,
+                        fork_session_id,
+                        json.dumps(result),
+                    ),
+                )
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT experiment_id, created_at, baseline_session_id, fork_session_id,
+                    result_json
+                FROM experiments WHERE experiment_id = ?;
+                """,
+                (experiment_id,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            result = json.loads(row["result_json"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        return {
+            "experiment_id": row["experiment_id"],
+            "created_at": row["created_at"],
+            "baseline_session_id": row["baseline_session_id"],
+            "fork_session_id": row["fork_session_id"],
+            "result": result,
+        }
+
+    def list_experiments(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT experiment_id, created_at, baseline_session_id, fork_session_id
+                FROM experiments ORDER BY created_at DESC;
+                """
+            ).fetchall()
+        return [
+            {
+                "experiment_id": row["experiment_id"],
+                "created_at": row["created_at"],
+                "baseline_session_id": row["baseline_session_id"],
+                "fork_session_id": row["fork_session_id"],
+            }
+            for row in rows
+        ]
+
+    def create_evaluation(
+        self,
+        evaluation_id: str,
+        target_type: str,
+        session_id: str | None,
+        experiment_id: str | None,
+        criteria: dict[str, Any],
+        result: dict[str, Any],
+        suite_id: str | None = None,
+        suite_version: int | None = None,
+    ) -> dict[str, Any]:
+        evaluated_at = result["evaluated_at"]
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO evaluations (
+                        evaluation_id, evaluated_at, target_type, session_id, experiment_id,
+                        criteria_json, result_json, suite_id, suite_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        evaluation_id,
+                        evaluated_at,
+                        target_type,
+                        session_id,
+                        experiment_id,
+                        json.dumps(criteria),
+                        json.dumps(result),
+                        suite_id,
+                        suite_version,
+                    ),
+                )
+        return {
+            "evaluation_id": evaluation_id,
+            "evaluated_at": evaluated_at,
+            "target_type": target_type,
+            "session_id": session_id,
+            "experiment_id": experiment_id,
+            "criteria": criteria,
+            "result": result,
+            "suite_id": suite_id,
+            "suite_version": suite_version,
+        }
+
+    def list_evaluations(
+        self,
+        session_id: str | None = None,
+        experiment_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions = []
+        parameters: list[str] = []
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            parameters.append(session_id)
+        if experiment_id is not None:
+            conditions.append("experiment_id = ?")
+            parameters.append(experiment_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT evaluation_id, evaluated_at, target_type, session_id, experiment_id,
+                criteria_json, result_json, suite_id, suite_version
+                FROM evaluations {where}
+                ORDER BY evaluated_at DESC, evaluation_id DESC;
+                """,
+                parameters,
+            ).fetchall()
+        evaluations = []
+        for row in rows:
+            try:
+                criteria = json.loads(row["criteria_json"])
+                result = json.loads(row["result_json"])
+            except (TypeError, ValueError):
+                continue
+            evaluations.append(
+                {
+                    "evaluation_id": row["evaluation_id"],
+                    "evaluated_at": row["evaluated_at"],
+                    "target_type": row["target_type"],
+                    "session_id": row["session_id"],
+                    "experiment_id": row["experiment_id"],
+                    "criteria": criteria,
+                    "result": result,
+                    "suite_id": row["suite_id"],
+                    "suite_version": row["suite_version"],
+                }
+            )
+        return evaluations
+
+    def create_evaluation_suite(
+        self,
+        suite_id: str,
+        version: int,
+        name: str,
+        description: str,
+        criteria: dict[str, Any],
+        evaluator_version: str,
+    ) -> dict[str, Any]:
+        created_at = datetime.now(UTC).isoformat()
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO evaluation_suites (
+                        suite_id, version, name, description, criteria_json,
+                        evaluator_version, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        suite_id,
+                        version,
+                        name,
+                        description,
+                        json.dumps(criteria),
+                        evaluator_version,
+                        created_at,
+                    ),
+                )
+        return {
+            "suite_id": suite_id,
+            "version": version,
+            "name": name,
+            "description": description,
+            "criteria": criteria,
+            "evaluator_version": evaluator_version,
+            "created_at": created_at,
+        }
+
+    def get_evaluation_suite(
+        self, suite_id: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            if version is None:
+                row = self._conn.execute(
+                    """
+                    SELECT suite_id, version, name, description, criteria_json,
+                        evaluator_version, created_at
+                    FROM evaluation_suites WHERE suite_id = ?
+                    ORDER BY version DESC LIMIT 1;
+                    """,
+                    (suite_id,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    """
+                    SELECT suite_id, version, name, description, criteria_json,
+                        evaluator_version, created_at
+                    FROM evaluation_suites WHERE suite_id = ? AND version = ?;
+                    """,
+                    (suite_id, version),
+                ).fetchone()
+        if not row:
+            return None
+        try:
+            criteria = json.loads(row["criteria_json"])
+        except (TypeError, ValueError):
+            return None
+        return {
+            "suite_id": row["suite_id"],
+            "version": row["version"],
+            "name": row["name"],
+            "description": row["description"],
+            "criteria": criteria,
+            "evaluator_version": row["evaluator_version"],
+            "created_at": row["created_at"],
+        }
+
+    def list_evaluation_suites(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT suite_id, MAX(version) AS version
+                FROM evaluation_suites GROUP BY suite_id
+                ORDER BY suite_id;
+                """
+            ).fetchall()
+        suites = []
+        for row in rows:
+            suite = self.get_evaluation_suite(row["suite_id"], row["version"])
+            if suite is not None:
+                suites.append(suite)
+        return suites
+
+    def list_evaluation_suite_versions(self, suite_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT version FROM evaluation_suites
+                WHERE suite_id = ? ORDER BY version DESC;
+                """,
+                (suite_id,),
+            ).fetchall()
+        versions = []
+        for row in rows:
+            suite = self.get_evaluation_suite(suite_id, row["version"])
+            if suite is not None:
+                versions.append(suite)
+        return versions
+
+    def create_replay_validation(
+        self,
+        validation_id: str,
+        session_id: str,
+        validated_at: str,
+        validation_version: str,
+        status: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO replay_validations (
+                        validation_id, session_id, validated_at, validation_version,
+                        status, result_json
+                    ) VALUES (?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        validation_id,
+                        session_id,
+                        validated_at,
+                        validation_version,
+                        status,
+                        json.dumps(result),
+                    ),
+                )
+        return {
+            "validation_id": validation_id,
+            "session_id": session_id,
+            "validated_at": validated_at,
+            "validation_version": validation_version,
+            "status": status,
+            "result": result,
+        }
+
+    def list_replay_validations(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT validation_id, session_id, validated_at, validation_version,
+                    status, result_json
+                FROM replay_validations
+                WHERE session_id = ?
+                ORDER BY validated_at DESC, validation_id DESC;
+                """,
+                (session_id,),
+            ).fetchall()
+        validations = []
+        for row in rows:
+            try:
+                result = json.loads(row["result_json"])
+            except (TypeError, ValueError):
+                continue
+            validations.append(
+                {
+                    "validation_id": row["validation_id"],
+                    "session_id": row["session_id"],
+                    "validated_at": row["validated_at"],
+                    "validation_version": row["validation_version"],
+                    "status": row["status"],
+                    "result": result,
+                }
+            )
+        return validations

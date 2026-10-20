@@ -23,7 +23,7 @@ def test_counterfactual_experiment_records_failure_and_fork():
     assert result["events"]["added"][0]["name"] == "calculate_credit"
     assert result["events"]["removed"] == []
     assert result["metrics"]["duration_ms"]["available"] is True
-    assert "synthetic scenario" in result["metrics"]["duration_ms"]["label"]
+    assert "not a benchmark" in result["metrics"]["duration_ms"]["label"]
     assert result["metrics"]["tokens"]["available"] is False
     assert result["metrics"]["cost_usd_estimate"]["available"] is False
 

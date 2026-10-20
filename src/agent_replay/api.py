@@ -1,28 +1,47 @@
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
+import os
+import re
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent_replay.config import CONFIG_MUTATIONS_ENABLED, LIVE_RUN_ENABLED, USD_TO_INR
 from agent_replay.detector.config import DetectorConfig
 from agent_replay.detector.engine import DetectorEngine
+from agent_replay.evaluation import (
+    EVALUATOR_VERSION,
+    compare_evaluations,
+    evaluate_session,
+    validate_criteria,
+)
 from agent_replay.models import Event
 from agent_replay.pricing import get_price_engine
 from agent_replay.providers import call_provider, configured_providers
 from agent_replay.replay.engine import ReplayEngine
-from agent_replay.replay.exceptions import ReplayDivergenceError
-from agent_replay.replay.experiment import run_counterfactual_experiment
-from agent_replay.session_service import SessionService, event_status
+from agent_replay.replay.exceptions import ReplayCompletedError, ReplayDivergenceError
+from agent_replay.replay.experiment import (
+    list_supported_baselines,
+    run_counterfactual_experiment,
+)
+from agent_replay.session_service import (
+    SessionService,
+    cost_summary,
+    event_status,
+    token_usage_summary,
+)
 from agent_replay.storage import SQLiteStorage
 
 logger = logging.getLogger(__name__)
@@ -96,8 +115,14 @@ SCENARIOS: dict[str, dict[str, str]] = {
 
 class LiveRunRequest(BaseModel):
     scenario_id: str
-    timeout_seconds: float | None = None
-    simulate_delay_seconds: float | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0, le=30)
+    simulate_delay_seconds: float | None = Field(default=None, ge=0, le=30)
+
+
+class LiveModelRunRequest(BaseModel):
+    provider: Literal["openai", "anthropic", "gemini"]
+    prompt: str = Field(min_length=1, max_length=8000)
+    model: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 def _run_scenario_sync(
@@ -174,8 +199,80 @@ class DetectorConfigUpdate(BaseModel):
 
 class PlaygroundRequest(BaseModel):
     provider: Literal["openai", "anthropic", "gemini"]
-    prompt: str
-    model: str | None = None
+    prompt: str = Field(min_length=1, max_length=8000)
+    model: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class ExperimentRequest(BaseModel):
+    baseline_session_id: str
+    substitute_seq: int
+    substitute_result: Any
+
+
+class EvaluationRequest(BaseModel):
+    criteria: dict[str, Any] | None = None
+    suite_id: str | None = None
+    suite_version: int | None = None
+    replay_calls: list[ReplayCallRequest] | None = None
+
+
+class EvaluationSuiteCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    criteria: dict[str, Any]
+
+
+class EvaluationSuiteUpdateRequest(EvaluationSuiteCreateRequest):
+    current_version: int
+
+
+class ReplayValidationRequest(BaseModel):
+    calls: list[ReplayCallRequest] | None = None
+
+
+def _experiment_snapshot_events(session_id: str, raw_events: list[dict[str, Any]]) -> list[Event]:
+    events = []
+    for raw_event in raw_events:
+        event_data = dict(raw_event)
+        event_data["session_id"] = session_id
+        events.append(Event(**event_data))
+    return events
+
+
+def _suite_templates() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "output-correctness",
+            "name": "Output correctness",
+            "description": "Check explicit expected JSON values in a recorded result.",
+            "criteria": {"expected_output": {"result": "expected value"}},
+        },
+        {
+            "id": "required-information",
+            "name": "Required information",
+            "description": "Require selected output fields and phrases.",
+            "criteria": {
+                "required_fields": ["answer"],
+                "required_phrases": [],
+            },
+        },
+        {
+            "id": "tool-errors",
+            "name": "Tool execution errors",
+            "description": "Fail when recorded calls contain an error or failure result.",
+            "criteria": {"allow_tool_errors": False},
+        },
+        {
+            "id": "resource-limits",
+            "name": "Resource limits",
+            "description": "Check available recorded duration, token usage, and estimated cost.",
+            "criteria": {
+                "max_latency_ms": 5000,
+                "max_tokens": 2000,
+                "max_cost_usd": 0.02,
+            },
+        },
+    ]
 
 
 def _decode_json(value: str | None) -> Any:
@@ -205,6 +302,30 @@ def _price_response() -> dict[str, Any]:
     return {"models": models, "usd_to_inr": USD_TO_INR}
 
 
+_SECRET_TEXT_PATTERNS = (
+    re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})\b"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)((?:api[_-]?key|token|secret)\s*[:=]\s*)[^\s,;]+"),
+)
+
+
+def _redact_trace_text(value: str) -> str:
+    redacted = value
+    redacted = _SECRET_TEXT_PATTERNS[0].sub("[REDACTED]", redacted)
+    redacted = _SECRET_TEXT_PATTERNS[1].sub(r"\1[REDACTED]", redacted)
+    return _SECRET_TEXT_PATTERNS[2].sub(r"\1[REDACTED]", redacted)
+
+
+def _optional_usage_count(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 def create_app(
     storage: SQLiteStorage | None = None,
     *,
@@ -230,6 +351,7 @@ def create_app(
     allow_config_mutations = (
         CONFIG_MUTATIONS_ENABLED if config_mutations_enabled is None else config_mutations_enabled
     )
+    live_model_run_slot = threading.BoundedSemaphore(1)
     price_engine = get_price_engine()
     stored_prices = actual_storage.get_setting("prices")
     if isinstance(stored_prices, dict):
@@ -244,25 +366,137 @@ def create_app(
         detector=DetectorEngine(config=detector_config),
     )
 
+    def authorize_provider_execution(request: Request) -> None:
+        client_host = request.client.host if request.client else ""
+        try:
+            is_loopback = ipaddress.ip_address(client_host).is_loopback
+        except ValueError:
+            is_loopback = client_host == "testclient"
+        if is_loopback:
+            return
+
+        configured_token = os.getenv("LIVE_RUN_AUTH_TOKEN", "")
+        if not configured_token:
+            raise HTTPException(
+                status_code=503,
+                detail="Remote provider execution requires LIVE_RUN_AUTH_TOKEN on the server.",
+            )
+        authorization = request.headers.get("authorization", "")
+        prefix = "Bearer "
+        supplied_token = authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        if not supplied_token or not hmac.compare_digest(supplied_token, configured_token):
+            raise HTTPException(
+                status_code=401, detail="Remote provider execution is unauthorized."
+            )
+
+    def authorize_config_mutation(request: Request) -> None:
+        if not allow_config_mutations:
+            raise HTTPException(
+                status_code=403,
+                detail="Configuration changes are disabled on this server.",
+            )
+        client_host = request.client.host if request.client else ""
+        try:
+            is_loopback = ipaddress.ip_address(client_host).is_loopback
+        except ValueError:
+            is_loopback = client_host == "testclient"
+        if is_loopback:
+            return
+
+        configured_token = os.getenv("CONFIG_MUTATIONS_AUTH_TOKEN", "")
+        if not configured_token:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Remote configuration changes require CONFIG_MUTATIONS_AUTH_TOKEN "
+                    "on the server."
+                ),
+            )
+        authorization = request.headers.get("authorization", "")
+        prefix = "Bearer "
+        supplied_token = authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        if not supplied_token or not hmac.compare_digest(supplied_token, configured_token):
+            raise HTTPException(
+                status_code=401,
+                detail="Remote configuration change is unauthorized.",
+            )
+
+    def configured_provider_model(provider_id: str, requested_model: str | None) -> str:
+        provider = next(
+            (item for item in configured_providers() if item["id"] == provider_id),
+            None,
+        )
+        if not provider or not provider["configured"] or not provider["models"]:
+            raise HTTPException(
+                status_code=503,
+                detail=f"No usable model is configured for {provider_id}.",
+            )
+        models = provider["models"]
+        if requested_model and requested_model not in models:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Model '{requested_model}' is not configured for {provider_id}.",
+            )
+        return requested_model or models[0]
+
+    def resolve_evaluation_criteria(
+        request: EvaluationRequest,
+    ) -> tuple[dict[str, Any], str | None, int | None]:
+        suite_id = request.suite_id
+        suite_version = request.suite_version
+        if suite_id:
+            if request.criteria is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide either suite_id or criteria, not both.",
+                )
+            suite = actual_storage.get_evaluation_suite(suite_id, suite_version)
+            if suite is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Evaluation suite '{suite_id}' was not found.",
+                )
+            raw_criteria = suite["criteria"]
+            suite_version = suite["version"]
+        else:
+            if suite_version is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="suite_version requires suite_id.",
+                )
+            if request.criteria is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide criteria or select a saved evaluation suite.",
+                )
+            raw_criteria = request.criteria
+        try:
+            return validate_criteria(raw_criteria), suite_id, suite_version
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     static_dir = Path(__file__).parent / "ui" / "static"
 
     @app.get("/api/sessions")
     def list_sessions() -> list[dict[str, Any]]:
         """List all recorded sessions with summary metrics."""
         summaries = actual_storage.list_sessions()
-        return [s.to_dict() for s in summaries]
+        items = []
+        for summary in summaries:
+            item = summary.to_dict()
+            item["total_cost_usd"], item["cost_status"] = cost_summary(
+                actual_storage.get_events(summary.session_id)
+            )
+            items.append(item)
+        return items
 
     @app.get("/api/overview")
     def get_overview() -> dict[str, Any]:
         summaries = actual_storage.list_sessions()
         total_events = sum(item.event_count for item in summaries)
         details = [session_service.get_session_details(item.session_id) for item in summaries]
-        model_events = [
-            event
-            for item in details
-            if item
-            for event in item["events"]
-            if event["type"] == "model_call"
+        all_events = [
+            event for item in summaries for event in actual_storage.get_events(item.session_id)
         ]
         return {
             "session_count": len(summaries),
@@ -270,10 +504,15 @@ def create_app(
             "successful_events": sum(item["successful_events"] for item in details if item),
             "failed_events": sum(item["failed_events"] for item in details if item),
             "total_duration_ms": round(sum(item.total_duration_ms for item in summaries), 2),
-            "model_usage_available": any(
-                event["tokens_in"] or event["tokens_out"] for event in model_events
-            ),
-            "recent_sessions": [item.to_dict() for item in summaries[:5]],
+            "model_usage_available": token_usage_summary(all_events)[2],
+            "recent_sessions": [
+                {
+                    **item.to_dict(),
+                    "total_cost_usd": cost_summary(actual_storage.get_events(item.session_id))[0],
+                    "cost_status": cost_summary(actual_storage.get_events(item.session_id))[1],
+                }
+                for item in summaries[:5]
+            ],
         }
 
     @app.get("/api/providers")
@@ -286,7 +525,8 @@ def create_app(
         model: str | None = Query(default=None, min_length=1),
         session_id: str | None = Query(default=None, min_length=1),
     ) -> dict[str, Any]:
-        grouped: dict[str, dict[str, Any]] = {}
+        grouped_events: dict[str, list[Event]] = {}
+        records: list[dict[str, Any]] = []
         sessions: list[dict[str, Any]] = []
         for summary in actual_storage.list_sessions():
             if session_id and summary.session_id != session_id:
@@ -301,59 +541,89 @@ def create_app(
             ]
             if not model_events:
                 continue
+            by_model: dict[str, list[Event]] = {}
             for event in model_events:
                 key = f"{event.provider or 'unknown'}:{event.model or event.name}"
-                item = grouped.setdefault(
-                    key,
+                grouped_events.setdefault(key, []).append(event)
+                by_model.setdefault(key, []).append(event)
+            for key, events in by_model.items():
+                model_cost, model_cost_status = cost_summary(events)
+                input_tokens, output_tokens, usage_available = token_usage_summary(events)
+                records.append(
                     {
-                        "provider": event.provider or "unknown",
-                        "model": event.model or event.name,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cost_usd": None,
-                        "cost_status": "unavailable",
-                        "sessions": 0,
-                    },
+                        "session_id": summary.session_id,
+                        "provider": events[0].provider or "unknown",
+                        "model": events[0].model or events[0].name,
+                        "event_count": len(events),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "usage_available": usage_available,
+                        "cost_usd": model_cost,
+                        "cost_status": model_cost_status,
+                    }
                 )
-                item["input_tokens"] += event.tokens_in
-                item["output_tokens"] += event.tokens_out
-                if event.cost_status != "unavailable":
-                    item["cost_usd"] = (item["cost_usd"] or 0.0) + event.cost_usd
-                    item["cost_status"] = event.cost_status
-                item["sessions"] = item["sessions"] + 1
-            available_cost = [
-                event.cost_usd for event in model_events if event.cost_status != "unavailable"
-            ]
+            session_cost, session_cost_status = cost_summary(model_events)
+            input_tokens, output_tokens, usage_available = token_usage_summary(model_events)
             sessions.append(
                 {
                     "session_id": summary.session_id,
-                    "models": len(model_events),
-                    "input_tokens": sum(event.tokens_in for event in model_events),
-                    "output_tokens": sum(event.tokens_out for event in model_events),
-                    "cost_usd": round(sum(available_cost), 8) if available_cost else None,
-                    "cost_available": any(
-                        event.cost_status != "unavailable" for event in model_events
+                    "models": len(
+                        {(event.provider, event.model or event.name) for event in model_events}
                     ),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "usage_available": usage_available,
+                    "cost_usd": session_cost,
+                    "cost_status": session_cost_status,
+                    "cost_available": session_cost is not None,
                 }
             )
-        for item in grouped.values():
-            if item["cost_usd"] is not None:
-                item["cost_usd"] = round(item["cost_usd"], 8)
-        return {"groups": list(grouped.values()), "sessions": sessions}
+        groups = []
+        for key, events in grouped_events.items():
+            model_cost, model_cost_status = cost_summary(events)
+            input_tokens, output_tokens, usage_available = token_usage_summary(events)
+            groups.append(
+                {
+                    "provider": events[0].provider or "unknown",
+                    "model": events[0].model or events[0].name,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "usage_available": usage_available,
+                    "cost_usd": model_cost,
+                    "cost_status": model_cost_status,
+                    "sessions": len({event.session_id for event in events}),
+                }
+            )
+        return {"groups": groups, "sessions": sessions, "records": records}
 
     @app.post("/api/playground/chat")
-    def playground_chat(request: PlaygroundRequest) -> dict[str, Any]:
+    def playground_chat(request: PlaygroundRequest, http_request: Request) -> dict[str, Any]:
+        authorize_provider_execution(http_request)
         if not request.prompt.strip():
             raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+        providers = {item["id"]: item for item in configured_providers()}
+        provider_config = providers[request.provider]
+        resolved_model = (
+            configured_provider_model(request.provider, request.model)
+            if provider_config["configured"]
+            else request.model
+        )
+        if not live_model_run_slot.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail="A provider request is already running; try again when it finishes.",
+            )
         session_id = f"playground_{uuid.uuid4().hex[:12]}"
         actual_storage.create_session(session_id, metadata={"provider": request.provider})
         started_at = datetime.now(UTC).isoformat()
         started = time.perf_counter()
         try:
-            response = call_provider(request.provider, request.prompt, request.model)
+            response = call_provider(request.provider, request.prompt, resolved_model)
             usage = response.usage or {}
-            tokens_in = usage.get("input_tokens") or usage.get("prompt_tokens")
-            tokens_out = usage.get("output_tokens") or usage.get("completion_tokens")
+            tokens_in = _optional_usage_count(usage.get("input_tokens", usage.get("prompt_tokens")))
+            tokens_out = _optional_usage_count(
+                usage.get("output_tokens", usage.get("completion_tokens"))
+            )
             cost = get_price_engine().calculate_known_cost(response.model, tokens_in, tokens_out)
             actual_storage.save_event(
                 Event(
@@ -363,12 +633,12 @@ def create_app(
                     name=response.model,
                     model=response.model,
                     provider=response.provider,
-                    args_json=json.dumps({"prompt": request.prompt}),
-                    result_json=json.dumps({"text": response.text}),
+                    args_json=json.dumps({"prompt": _redact_trace_text(request.prompt)}),
+                    result_json=json.dumps({"text": _redact_trace_text(response.text)}),
                     started_at=started_at,
                     duration_ms=round((time.perf_counter() - started) * 1000, 2),
-                    tokens_in=tokens_in or 0,
-                    tokens_out=tokens_out or 0,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
                     tokens_total=(
                         tokens_in + tokens_out
                         if tokens_in is not None and tokens_out is not None
@@ -384,6 +654,7 @@ def create_app(
                 "provider": response.provider,
                 "model": response.model,
                 "text": response.text,
+                "output_source": "real_provider_call",
                 "usage": response.usage,
                 "cost_usd": cost,
                 "cost_status": "estimated" if cost is not None else "unavailable",
@@ -396,15 +667,17 @@ def create_app(
                     type="model_call",
                     name=request.model or request.provider,
                     provider=request.provider,
-                    model=request.model,
-                    args_json=json.dumps({"prompt": request.prompt}),
-                    error=str(exc),
+                    model=resolved_model,
+                    args_json=json.dumps({"prompt": _redact_trace_text(request.prompt)}),
+                    error=_redact_trace_text(str(exc)),
                     error_type=type(exc).__name__,
                     started_at=started_at,
                     duration_ms=round((time.perf_counter() - started) * 1000, 2),
                 )
             )
             raise HTTPException(status_code=503, detail=str(exc)) from None
+        finally:
+            live_model_run_slot.release()
 
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict[str, Any]:
@@ -476,13 +749,9 @@ def create_app(
         return _price_response()
 
     @app.put("/api/prices")
-    def update_prices(update: PriceUpdate) -> dict[str, Any]:
+    def update_prices(update: PriceUpdate, http_request: Request) -> dict[str, Any]:
         """Save INR per 1K pricing values back to prices.json."""
-        if not allow_config_mutations:
-            raise HTTPException(
-                status_code=403,
-                detail="Configuration changes are disabled on this server.",
-            )
+        authorize_config_mutation(http_request)
         if any(
             rate.input_inr_per_1k < 0 or rate.output_inr_per_1k < 0
             for rate in update.models.values()
@@ -506,14 +775,17 @@ def create_app(
     @app.get("/api/cost-over-time")
     def get_cost_over_time() -> dict[str, Any]:
         """Return session costs ordered chronologically for the cost view."""
-        points = [
-            {
-                "session_id": summary.session_id,
-                "started_at": summary.started_at,
-                "total_cost_usd": summary.total_cost_usd,
-            }
-            for summary in reversed(actual_storage.list_sessions())
-        ]
+        points = []
+        for summary in reversed(actual_storage.list_sessions()):
+            total_cost, status = cost_summary(actual_storage.get_events(summary.session_id))
+            points.append(
+                {
+                    "session_id": summary.session_id,
+                    "started_at": summary.started_at,
+                    "total_cost_usd": total_cost,
+                    "cost_status": status,
+                }
+            )
         return {"points": points}
 
     @app.get("/api/detector-config")
@@ -521,12 +793,11 @@ def create_app(
         return vars(session_service.detector.config)
 
     @app.put("/api/detector-config")
-    def update_detector_config(update: DetectorConfigUpdate) -> dict[str, Any]:
-        if not allow_config_mutations:
-            raise HTTPException(
-                status_code=403,
-                detail="Configuration changes are disabled on this server.",
-            )
+    def update_detector_config(
+        update: DetectorConfigUpdate,
+        http_request: Request,
+    ) -> dict[str, Any]:
+        authorize_config_mutation(http_request)
         values = update.model_dump()
         if (
             values["max_repeated_tool_calls"] < 1
@@ -642,22 +913,756 @@ def create_app(
             "halted": any(event["status"] == "diverged" for event in results),
         }
 
+    @app.get("/api/sessions/{session_id}/replay-validations")
+    def list_replay_validations(session_id: str) -> dict[str, Any]:
+        if not actual_storage.get_session(session_id):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        return {"validations": actual_storage.list_replay_validations(session_id)}
+
+    @app.post("/api/sessions/{session_id}/replay-validations")
+    def validate_recorded_replay(
+        session_id: str, request: ReplayValidationRequest
+    ) -> dict[str, Any]:
+        if not actual_storage.get_session(session_id):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        events = actual_storage.get_events(session_id)
+        validation_id = f"replay_validation_{uuid.uuid4().hex[:12]}"
+        validated_at = datetime.now(UTC).isoformat()
+        if not events:
+            result = {
+                "session_id": session_id,
+                "status": "unavailable",
+                "explanation": "This session has no recorded events to replay.",
+                "events": [],
+                "limitations": ["No trace evidence is available."],
+            }
+            return actual_storage.create_replay_validation(
+                validation_id,
+                session_id,
+                validated_at,
+                "1.0",
+                "unavailable",
+                result,
+            )
+
+        calls = request.calls
+        if calls is None:
+            calls = [
+                ReplayCallRequest(
+                    type=event.type,
+                    name=event.name,
+                    args=_decode_json(event.args_json),
+                )
+                for event in events
+            ]
+        replay_engine = ReplayEngine(
+            session_id=session_id,
+            storage=actual_storage,
+            mode="strict",
+        )
+        event_results: list[dict[str, Any]] = []
+        failed = False
+        unavailable = False
+        for index, call in enumerate(calls):
+            event = events[index] if index < len(events) else None
+            if event is None:
+                event_results.append(
+                    {
+                        "seq": index + 1,
+                        "status": "diverged",
+                        "explanation": "Replay requested a call beyond the recorded trace.",
+                        "requested": call.model_dump(),
+                    }
+                )
+                failed = True
+                break
+            try:
+                if call.type == "tool_call":
+                    replay_engine.handle_tool_call(call.name, call.args)
+                else:
+                    replay_engine.handle_model_call(call.name, call.args)
+                if event.result_json is None:
+                    status = "missing_result"
+                    unavailable = True
+                    explanation = "The event has no recorded result or recorded error."
+                else:
+                    status = "matched"
+                    explanation = "Call matched and strict replay returned its recorded result."
+                event_results.append(
+                    {
+                        "seq": event.seq,
+                        "type": event.type,
+                        "name": event.name,
+                        "status": status,
+                        "explanation": explanation,
+                        "recorded_result": _decode_json(event.result_json),
+                    }
+                )
+            except ReplayDivergenceError as error:
+                event_results.append(
+                    {
+                        "seq": error.seq,
+                        "status": "diverged",
+                        "explanation": "Requested call does not match the recorded trace.",
+                        "expected": {
+                            "type": error.expected_type,
+                            "name": error.expected_name,
+                            "args": _decode_json(error.expected_args),
+                        },
+                        "requested": {
+                            "type": error.actual_type,
+                            "name": error.actual_name,
+                            "args": error.actual_args,
+                        },
+                    }
+                )
+                failed = True
+                break
+            except ReplayCompletedError:
+                event_results.append(
+                    {
+                        "seq": event.seq,
+                        "status": "diverged",
+                        "explanation": (
+                            "Replay engine reported that the recorded call sequence was exhausted."
+                        ),
+                    }
+                )
+                failed = True
+                break
+            except Exception as error:
+                if event.error:
+                    event_results.append(
+                        {
+                            "seq": event.seq,
+                            "type": event.type,
+                            "name": event.name,
+                            "status": "matched_recorded_error",
+                            "explanation": (
+                                "Strict replay reproduced the error recorded for this event."
+                            ),
+                            "error": event.error,
+                            "error_type": event.error_type,
+                        }
+                    )
+                else:
+                    event_results.append(
+                        {
+                            "seq": event.seq,
+                            "type": event.type,
+                            "name": event.name,
+                            "status": "replay_error",
+                            "explanation": "Strict replay failed unexpectedly.",
+                            "error": str(error),
+                            "error_type": type(error).__name__,
+                        }
+                    )
+                    failed = True
+                    break
+
+        if not failed and len(calls) < len(events):
+            unavailable = True
+            event_results.extend(
+                {
+                    "seq": event.seq,
+                    "type": event.type,
+                    "name": event.name,
+                    "status": "not_checked",
+                    "explanation": "No replay call was supplied for this recorded event.",
+                }
+                for event in events[len(calls) :]
+            )
+        status = "failed" if failed else "partial" if unavailable else "passed"
+        result = {
+            "session_id": session_id,
+            "status": status,
+            "explanation": {
+                "passed": "Strict replay validated the complete supplied call sequence.",
+                "failed": "Strict replay found a divergence or unexpected replay error.",
+                "partial": "Some recorded events had missing results or were not checked.",
+            }[status],
+            "events": event_results,
+            "limitations": [
+                "Validation uses the existing recorded trace; it does not rerun an agent."
+            ],
+        }
+        return actual_storage.create_replay_validation(
+            validation_id,
+            session_id,
+            validated_at,
+            "1.0",
+            status,
+            result,
+        )
+
+    @app.get("/api/evaluations")
+    def list_evaluations(
+        session_id: str | None = Query(default=None, min_length=1),
+        experiment_id: str | None = Query(default=None, min_length=1),
+    ) -> dict[str, Any]:
+        return {
+            "evaluations": actual_storage.list_evaluations(
+                session_id=session_id,
+                experiment_id=experiment_id,
+            )
+        }
+
+    @app.get("/api/evaluation-suites/templates")
+    def get_evaluation_suite_templates() -> dict[str, Any]:
+        return {"templates": _suite_templates()}
+
+    @app.get("/api/evaluation-suites")
+    def list_evaluation_suites() -> dict[str, Any]:
+        return {"suites": actual_storage.list_evaluation_suites()}
+
+    @app.post("/api/evaluation-suites")
+    def create_evaluation_suite(request: EvaluationSuiteCreateRequest) -> dict[str, Any]:
+        name = request.name.strip()
+        description = request.description.strip()
+        if not name or len(name) > 100:
+            raise HTTPException(status_code=422, detail="Suite name must be 1 to 100 characters.")
+        if len(description) > 500:
+            raise HTTPException(
+                status_code=422, detail="Suite description must be at most 500 characters."
+            )
+        try:
+            criteria = validate_criteria(request.criteria)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        suite_id = f"suite_{uuid.uuid4().hex[:12]}"
+        return actual_storage.create_evaluation_suite(
+            suite_id=suite_id,
+            version=1,
+            name=name,
+            description=description,
+            criteria=criteria,
+            evaluator_version=EVALUATOR_VERSION,
+        )
+
+    @app.get("/api/evaluation-suites/{suite_id}/versions")
+    def list_evaluation_suite_versions(suite_id: str) -> dict[str, Any]:
+        versions = actual_storage.list_evaluation_suite_versions(suite_id)
+        if not versions:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Evaluation suite '{suite_id}' was not found.",
+            )
+        return {"suite_id": suite_id, "versions": versions}
+
+    @app.get("/api/evaluation-suites/{suite_id}")
+    def get_evaluation_suite(
+        suite_id: str, version: int | None = Query(default=None, ge=1)
+    ) -> dict[str, Any]:
+        suite = actual_storage.get_evaluation_suite(suite_id, version)
+        if suite is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Evaluation suite '{suite_id}' version {version or 'latest'} was not found."
+                ),
+            )
+        return suite
+
+    @app.put("/api/evaluation-suites/{suite_id}")
+    def update_evaluation_suite(
+        suite_id: str, request: EvaluationSuiteUpdateRequest
+    ) -> dict[str, Any]:
+        current = actual_storage.get_evaluation_suite(suite_id)
+        if current is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Evaluation suite '{suite_id}' was not found.",
+            )
+        if request.current_version != current["version"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Suite is now version {current['version']}; reload it before saving changes."
+                ),
+            )
+        name = request.name.strip()
+        description = request.description.strip()
+        if not name or len(name) > 100:
+            raise HTTPException(status_code=422, detail="Suite name must be 1 to 100 characters.")
+        if len(description) > 500:
+            raise HTTPException(
+                status_code=422, detail="Suite description must be at most 500 characters."
+            )
+        try:
+            criteria = validate_criteria(request.criteria)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return actual_storage.create_evaluation_suite(
+            suite_id=suite_id,
+            version=current["version"] + 1,
+            name=name,
+            description=description,
+            criteria=criteria,
+            evaluator_version=EVALUATOR_VERSION,
+        )
+
+    @app.post("/api/evaluations/sessions/{session_id}")
+    def evaluate_recorded_session(session_id: str, request: EvaluationRequest) -> dict[str, Any]:
+        if not actual_storage.get_session(session_id):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        criteria, suite_id, suite_version = resolve_evaluation_criteria(request)
+        events = actual_storage.get_events(session_id)
+        result = evaluate_session(session_id, events, criteria)
+        if request.replay_calls is not None:
+            replay_checks = []
+            for index, call in enumerate(request.replay_calls):
+                if index >= len(events):
+                    replay_checks.append(
+                        {
+                            "status": "diverged",
+                            "seq": index + 1,
+                            "expected": None,
+                            "requested": call.model_dump(),
+                        }
+                    )
+                    break
+                event = events[index]
+                expected = {
+                    "type": event.type,
+                    "name": event.name,
+                    "args": _decode_json(event.args_json),
+                }
+                requested = call.model_dump()
+                if (
+                    expected["type"] != call.type
+                    or expected["name"] != call.name
+                    or expected["args"] != call.args
+                ):
+                    replay_checks.append(
+                        {
+                            "status": "diverged",
+                            "seq": event.seq,
+                            "expected": expected,
+                            "requested": requested,
+                        }
+                    )
+                    break
+                replay_checks.append(
+                    {
+                        "status": "matched",
+                        "seq": event.seq,
+                        "expected": expected,
+                        "requested": requested,
+                    }
+                )
+            if not any(item["status"] == "diverged" for item in replay_checks):
+                if not events:
+                    replay_status = "unavailable"
+                elif len(request.replay_calls) < len(events):
+                    replay_status = "incomplete"
+                    replay_checks.append(
+                        {
+                            "status": "not_checked",
+                            "seq": events[len(request.replay_calls)].seq,
+                            "reason": "The replay call sequence ended before the trace did.",
+                        }
+                    )
+                else:
+                    replay_status = "passed"
+            else:
+                replay_status = "diverged"
+            replay_explanations = {
+                "passed": "Every supplied replay call matched the recorded trace.",
+                "incomplete": "Replay call sequence ended before all recorded events were checked.",
+                "diverged": "Replay call sequence diverged from the recorded trace.",
+                "unavailable": "The session has no events to validate.",
+            }
+            result["replay_validity"] = {
+                "status": replay_status,
+                "explanation": replay_explanations[replay_status],
+                "evidence": replay_checks,
+            }
+            replay_evaluator_status = {
+                "passed": "passed",
+                "incomplete": "partial",
+                "diverged": "failed",
+                "unavailable": "unavailable",
+            }[replay_status]
+            result["evaluators"]["replay_divergence"] = {
+                "name": "Strict replay divergence",
+                "version": result["evaluator_version"],
+                "status": replay_evaluator_status,
+                "explanation": result["replay_validity"]["explanation"],
+                "evidence": replay_checks,
+                "limitations": [],
+            }
+            if replay_evaluator_status == "failed":
+                result["status"] = "failed"
+                result["status_explanation"] = (
+                    "Strict replay diverged from the recorded trace; inspect the mismatched call."
+                )
+            elif replay_evaluator_status == "partial" and result["status"] == "passed":
+                result["status"] = "partial"
+                result["status_explanation"] = (
+                    "Replay validation was incomplete because not all recorded calls were supplied."
+                )
+        evaluation_id = f"evaluation_{uuid.uuid4().hex[:12]}"
+        result["suite_id"] = suite_id
+        result["suite_version"] = suite_version
+        record = actual_storage.create_evaluation(
+            evaluation_id=evaluation_id,
+            target_type="session",
+            session_id=session_id,
+            experiment_id=None,
+            criteria=criteria,
+            result=result,
+            suite_id=suite_id,
+            suite_version=suite_version,
+        )
+        return record
+
+    @app.get("/api/experiments/baselines")
+    def get_experiment_baselines() -> dict[str, Any]:
+        return {"baselines": list_supported_baselines(actual_storage)}
+
+    @app.get("/api/experiments")
+    def list_experiments() -> dict[str, Any]:
+        return {"experiments": actual_storage.list_experiments()}
+
+    @app.get("/api/experiments/{experiment_id}")
+    def get_experiment(experiment_id: str) -> dict[str, Any]:
+        experiment = actual_storage.get_experiment(experiment_id)
+        if not experiment:
+            raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
+        return experiment
+
+    @app.get("/api/experiments/{experiment_id}/evaluations")
+    def list_experiment_evaluations(experiment_id: str) -> dict[str, Any]:
+        if not actual_storage.get_experiment(experiment_id):
+            raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
+        return {"evaluations": actual_storage.list_evaluations(experiment_id=experiment_id)}
+
+    @app.post("/api/experiments/{experiment_id}/evaluations")
+    def evaluate_experiment(experiment_id: str, request: EvaluationRequest) -> dict[str, Any]:
+        experiment = actual_storage.get_experiment(experiment_id)
+        if not experiment:
+            raise HTTPException(status_code=404, detail=f"Experiment '{experiment_id}' not found.")
+        criteria, suite_id, suite_version = resolve_evaluation_criteria(request)
+
+        experiment_result = experiment["result"]
+        baseline_id = experiment["baseline_session_id"]
+        fork_id = experiment["fork_session_id"]
+        baseline_events = actual_storage.get_events(baseline_id)
+        fork_events = actual_storage.get_events(fork_id)
+        limitations = []
+        if not baseline_events:
+            baseline_snapshot = experiment_result.get("events", {}).get("baseline", [])
+            baseline_events = _experiment_snapshot_events(baseline_id, baseline_snapshot)
+            limitations.append(
+                "Baseline session events were read from the saved experiment snapshot."
+            )
+        if not fork_events:
+            fork_snapshot = experiment_result.get("events", {}).get("forked", [])
+            fork_events = _experiment_snapshot_events(fork_id, fork_snapshot)
+            limitations.append("Fork session events were read from the saved experiment snapshot.")
+
+        baseline = evaluate_session(baseline_id, baseline_events, criteria)
+        fork = evaluate_session(fork_id, fork_events, criteria)
+        result = {
+            "experiment_id": experiment_id,
+            "suite_id": suite_id,
+            "suite_version": suite_version,
+            "evaluator_version": baseline["evaluator_version"],
+            "evaluated_at": datetime.now(UTC).isoformat(),
+            "status": (
+                "failed"
+                if "failed" in {baseline["status"], fork["status"]}
+                else "partial"
+                if "partial" in {baseline["status"], fork["status"]}
+                else "passed"
+                if baseline["status"] == fork["status"] == "passed"
+                else "unavailable"
+            ),
+            "baseline_session_id": baseline_id,
+            "fork_session_id": fork_id,
+            "replay_validity": {
+                "status": "passed",
+                "explanation": (
+                    "The saved guided experiment completed strict replay before the fork. "
+                    "This is replay validity, not a task-quality score."
+                ),
+                "evidence": experiment_result.get("evidence", {}).get("strict_replay"),
+            },
+            "baseline": baseline,
+            "fork": fork,
+            "comparison": compare_evaluations(baseline, fork),
+            "limitations": limitations,
+        }
+        evaluation_id = f"evaluation_{uuid.uuid4().hex[:12]}"
+        return actual_storage.create_evaluation(
+            evaluation_id=evaluation_id,
+            target_type="experiment",
+            session_id=None,
+            experiment_id=experiment_id,
+            criteria=criteria,
+            result=result,
+            suite_id=suite_id,
+            suite_version=suite_version,
+        )
+
+    @app.post("/api/experiments")
+    def create_guided_experiment(request: ExperimentRequest) -> dict[str, Any]:
+        if request.substitute_result is None:
+            raise HTTPException(
+                status_code=422,
+                detail="The replacement tool response must be a JSON object, not null.",
+            )
+        if not any(
+            baseline["session_id"] == request.baseline_session_id
+            for baseline in list_supported_baselines(actual_storage)
+        ):
+            if not actual_storage.get_session(request.baseline_session_id):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Baseline session '{request.baseline_session_id}' not found.",
+                )
+            raise HTTPException(
+                status_code=422,
+                detail="This session is not eligible. Guided experiments currently support "
+                "the recorded scenario-2 account workflow.",
+            )
+        try:
+            return run_counterfactual_experiment(
+                actual_storage,
+                baseline_session_id=request.baseline_session_id,
+                substitute_seq=request.substitute_seq,
+                substitute_result=request.substitute_result,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/api/experiments/counterfactual")
     def run_counterfactual() -> dict[str, Any]:
         """Run the deterministic local failure-and-recovery experiment."""
         return run_counterfactual_experiment(actual_storage)
 
+    @app.get("/api/live/status")
+    def get_live_status() -> dict[str, Any]:
+        return {
+            "execution_enabled": allow_live_runs,
+            "instrumented_recording_supported": True,
+            "monitoring_mode": "periodic session-list refresh",
+            "model_only_runs_supported": True,
+            "remote_execution_requires_token": True,
+            "message": (
+                "Bounded model-only runs and fixed scenarios are enabled; remote execution "
+                "requires LIVE_RUN_AUTH_TOKEN."
+                if allow_live_runs
+                else "Live execution is disabled by server configuration. Instrumented agents "
+                "can still record sessions into this server's storage."
+            ),
+        }
+
     @app.get("/api/live/scenarios")
     def get_live_scenarios() -> dict[str, Any]:
         return SCENARIOS
 
-    @app.post("/api/live/run")
-    async def run_live_scenario(request: LiveRunRequest) -> dict[str, Any]:
+    def execute_live_model_run(
+        session_id: str,
+        provider: str,
+        model: str,
+        prompt: str,
+    ) -> None:
+        started_at = _utc_now()
+        started = time.perf_counter()
+        event = Event(
+            session_id=session_id,
+            seq=1,
+            type="model_call",
+            name=model,
+            provider=provider,
+            model=model,
+            args_json=json.dumps({"prompt": _redact_trace_text(prompt)}),
+            started_at=started_at,
+        )
+        event_saved = False
+        try:
+            actual_storage.update_session_metadata(
+                session_id,
+                {"run_status": "running", "run_started_at": started_at},
+            )
+            actual_storage.save_event(event)
+            event_saved = True
+
+            response = call_provider(provider, prompt, model)
+            usage = response.usage or {}
+            tokens_in = _optional_usage_count(usage.get("input_tokens"))
+            tokens_out = _optional_usage_count(usage.get("output_tokens"))
+            cost = price_engine.calculate_known_cost(response.model, tokens_in, tokens_out)
+            event.result_json = json.dumps({"text": _redact_trace_text(response.text)})
+            event.duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            event.tokens_in = tokens_in
+            event.tokens_out = tokens_out
+            event.tokens_total = (
+                tokens_in + tokens_out if tokens_in is not None and tokens_out is not None else None
+            )
+            event.cost_usd = cost if cost is not None else 0.0
+            event.cost_status = "estimated" if cost is not None else "unavailable"
+            event.cost_currency = "USD" if cost is not None else None
+            event.model = response.model
+            event.name = response.model
+            actual_storage.update_event(event)
+            actual_storage.update_session_metadata(
+                session_id,
+                {
+                    "run_status": "completed",
+                    "run_finished_at": _utc_now(),
+                    "run_error": None,
+                },
+            )
+        except Exception as exc:
+            logger.exception(
+                "Live provider execution failed: session_id=%s provider=%s",
+                session_id,
+                provider,
+            )
+            if event_saved:
+                event.error = _redact_trace_text(
+                    str(exc)
+                    if isinstance(exc, (RuntimeError, ValueError))
+                    else "Provider execution failed."
+                )
+                event.error_type = type(exc).__name__
+                event.duration_ms = round((time.perf_counter() - started) * 1000, 2)
+                try:
+                    actual_storage.update_event(event)
+                except Exception:
+                    logger.exception(
+                        "Unable to finalize failed live event: session_id=%s", session_id
+                    )
+            error_message = (
+                _redact_trace_text(str(exc))
+                if isinstance(exc, (RuntimeError, ValueError))
+                else "Provider execution failed; inspect server logs."
+            )
+            try:
+                actual_storage.update_session_metadata(
+                    session_id,
+                    {
+                        "run_status": "failed",
+                        "run_finished_at": _utc_now(),
+                        "run_error": error_message,
+                    },
+                )
+            except Exception:
+                logger.exception("Unable to persist live run failure: session_id=%s", session_id)
+        finally:
+            live_model_run_slot.release()
+
+    @app.get("/api/live/runs")
+    def list_live_model_runs(
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> dict[str, Any]:
+        runs = []
+        for summary in actual_storage.list_sessions():
+            metadata = actual_storage.get_session_metadata(summary.session_id)
+            if metadata.get("kind") != "live_model_run":
+                continue
+            runs.append(
+                {
+                    "run_id": summary.session_id,
+                    "session_id": summary.session_id,
+                    "status": metadata.get("run_status", "unknown"),
+                    "provider": metadata.get("provider"),
+                    "model": metadata.get("model"),
+                    "created_at": metadata.get("run_created_at"),
+                    "event_count": summary.event_count,
+                    "error": metadata.get("run_error"),
+                }
+            )
+            if len(runs) >= limit:
+                break
+        return {"runs": runs}
+
+    @app.get("/api/live/runs/{run_id}")
+    def get_live_model_run(run_id: str) -> dict[str, Any]:
+        summary = actual_storage.get_session(run_id)
+        metadata = actual_storage.get_session_metadata(run_id)
+        if not summary or metadata.get("kind") != "live_model_run":
+            raise HTTPException(status_code=404, detail=f"Live run '{run_id}' was not found.")
+        return {
+            "run_id": run_id,
+            "session_id": run_id,
+            "status": metadata.get("run_status", "unknown"),
+            "provider": metadata.get("provider"),
+            "model": metadata.get("model"),
+            "created_at": metadata.get("run_created_at"),
+            "started_at": metadata.get("run_started_at"),
+            "finished_at": metadata.get("run_finished_at"),
+            "error": metadata.get("run_error"),
+            "event_count": summary.event_count,
+            "events": [event.to_dict() for event in actual_storage.get_events(run_id)],
+        }
+
+    @app.post("/api/live/runs", status_code=202)
+    def start_live_model_run(
+        request: LiveModelRunRequest,
+        background_tasks: BackgroundTasks,
+        http_request: Request,
+    ) -> dict[str, Any]:
         if not allow_live_runs:
             raise HTTPException(
                 status_code=503,
                 detail="Live execution is not enabled on this server.",
             )
+        authorize_provider_execution(http_request)
+        if not request.prompt.strip():
+            raise HTTPException(status_code=422, detail="Prompt cannot be empty.")
+        model = configured_provider_model(request.provider, request.model)
+        if not live_model_run_slot.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail="A provider request is already running; try again when it finishes.",
+            )
+
+        session_id = f"live_{uuid.uuid4().hex}"
+        created_at = _utc_now()
+        try:
+            actual_storage.create_session(
+                session_id,
+                metadata={
+                    "kind": "live_model_run",
+                    "provider": request.provider,
+                    "model": model,
+                    "run_status": "queued",
+                    "run_created_at": created_at,
+                },
+            )
+            background_tasks.add_task(
+                execute_live_model_run,
+                session_id,
+                request.provider,
+                model,
+                request.prompt,
+            )
+        except Exception:
+            live_model_run_slot.release()
+            logger.exception("Unable to queue live run: session_id=%s", session_id)
+            raise HTTPException(status_code=500, detail="Unable to queue the live run.") from None
+        return {
+            "run_id": session_id,
+            "session_id": session_id,
+            "status": "queued",
+            "provider": request.provider,
+            "model": model,
+        }
+
+    @app.post("/api/live/run")
+    async def run_live_scenario(
+        request: LiveRunRequest,
+        http_request: Request,
+    ) -> dict[str, Any]:
+        if not allow_live_runs:
+            raise HTTPException(
+                status_code=503,
+                detail="Live execution is not enabled on this server.",
+            )
+        authorize_provider_execution(http_request)
 
         if request.scenario_id not in SCENARIOS:
             raise HTTPException(
@@ -699,8 +1704,9 @@ def create_app(
 
         details = session_service.get_session_details(session_id)
         event_count = details["event_count"] if details else capped_storage.step_count
-        cost_usd = details["total_cost_usd"] if details else 0.0
-        cost_inr = round(cost_usd * USD_TO_INR, 4)
+        cost_usd = details["total_cost_usd"] if details else None
+        cost_status = details["cost_status"] if details else "unavailable"
+        cost_inr = round(cost_usd * USD_TO_INR, 4) if cost_usd is not None else None
 
         if status == "done":
             msg = f"Completed successfully with {event_count} events."
@@ -717,6 +1723,7 @@ def create_app(
             "event_count": event_count,
             "total_cost_usd": cost_usd,
             "total_cost_inr": cost_inr,
+            "cost_status": cost_status,
             "message": msg,
         }
 

@@ -19,6 +19,10 @@
       </div>
     </div>
     <div class="header-actions">
+      <button id="mobile-nav-toggle" class="btn btn-secondary mobile-nav-toggle" type="button" aria-label="Open navigation" aria-controls="app-sidebar" aria-expanded="false">☰</button>
+      <button id="session-context" class="session-context btn btn-secondary" type="button">
+        No session selected
+      </button>
       <span id="session-count-badge" class="badge badge-neutral">0 Sessions</span>
       <button id="refresh-btn" class="btn btn-secondary">↻ Refresh</button>
     </div>
@@ -30,16 +34,18 @@
       <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Collapse navigation">☰</button>
       <nav class="sidebar-nav" aria-label="Primary navigation">
         <button class="sidebar-link active" data-tab="overview"><span>⌂</span><b>Overview</b></button>
-        <button class="sidebar-link" data-tab="timeline"><span>◌</span><b>Observability / Traces</b></button>
-        <button class="sidebar-link" data-tab="sessions"><span>▤</span><b>Recorded Sessions</b></button>
-        <button class="sidebar-link" data-tab="replay"><span>↪</span><b>Replay & Fork</b></button>
+        <button class="sidebar-link" data-tab="timeline"><span>◌</span><b>Traces</b></button>
+        <button class="sidebar-link" data-tab="replay-guide"><span>◇</span><b>Replay Guide</b></button>
+        <button class="sidebar-link" data-tab="replay"><span>↪</span><b>Replay</b></button>
         <button class="sidebar-link" data-tab="experiment"><span>◇</span><b>Experiments</b></button>
-        <button class="sidebar-link" data-tab="cost"><span>$</span><b>Model Usage & Costs</b></button>
+        <button class="sidebar-link" data-tab="cost"><span>$</span><b>Usage & Costs</b></button>
         <button class="sidebar-link" data-tab="playground"><span>✦</span><b>AI Playground</b></button>
+        <button class="sidebar-link" data-tab="live"><span>◉</span><b>Live Monitor / Run</b></button>
+        <button class="sidebar-link" data-tab="detector"><span>⚑</span><b>Detector Rules</b></button>
       </nav>
     </aside>
     <!-- Left Sidebar: Session List -->
-    <aside class="sidebar">
+    <aside class="sidebar" id="sessions-sidebar">
       <div class="sidebar-header">
         <h2>Recorded Sessions</h2>
         <input type="text" id="session-search" placeholder="Search sessions..." class="search-input">
@@ -51,15 +57,6 @@
 
     <!-- Main Content Area: Session Details & Timeline -->
     <main class="main-content">
-      <nav class="tab-bar" aria-label="Workspace views">
-        <button class="tab-btn active" data-tab="timeline" aria-selected="true">Timeline</button>
-        <button class="tab-btn" data-tab="replay" aria-selected="false">Replay</button>
-        <button class="tab-btn" data-tab="experiment" aria-selected="false">Experiment</button>
-        <button class="tab-btn" data-tab="live" aria-selected="false">Live run</button>
-        <button class="tab-btn" data-tab="cost" aria-selected="false">Model usage & costs</button>
-        <button class="tab-btn" data-tab="detector" aria-selected="false">Detector rules</button>
-      </nav>
-
       <section id="tab-timeline" class="tab-panel active" data-panel="timeline">
         <div id="no-session-selected" class="empty-state">
           <div class="empty-icon">🔍</div>
@@ -93,31 +90,6 @@
           <div class="metric-card">
             <span class="metric-label">Recorded Cost</span>
             <span id="metric-cost" class="metric-value highlight-green">N/A</span>
-          </div>
-        </section>
-
-        <section id="tab-overview" class="tab-panel" data-panel="overview" hidden>
-          <div class="panel-card">
-            <h2>Overview</h2>
-            <p class="text-muted">Local recording health and recent activity from the AgentReplay database.</p>
-            <div id="overview-metrics" class="metrics-grid"></div>
-            <h3 class="section-heading">Recent sessions</h3>
-            <div id="overview-recent" class="overview-list"><p class="text-muted">Loading overview...</p></div>
-          </div>
-        </section>
-
-        <section id="tab-playground" class="tab-panel" data-panel="playground" hidden>
-          <div class="panel-card playground-panel">
-            <h2>AI Playground</h2>
-            <p class="text-muted">Provider calls happen only when you submit. API keys remain server-side and are never recorded.</p>
-            <div id="provider-notice" class="notice-panel">Loading provider configuration...</div>
-            <div id="playground-messages" class="playground-messages"></div>
-            <form id="playground-form" class="playground-form">
-              <select id="playground-provider" class="select-input" aria-label="Provider"></select>
-              <input id="playground-model" class="text-input" placeholder="Model (optional)">
-              <textarea id="playground-prompt" class="prompt-input" rows="4" placeholder="Ask a configured provider..." required></textarea>
-              <div class="playground-actions"><button id="playground-send" class="btn btn-primary" type="submit">Send</button><button id="playground-reset" class="btn btn-secondary" type="button">Reset</button></div>
-            </form>
           </div>
         </section>
 
@@ -159,6 +131,164 @@
         </div>
       </section>
 
+      <section id="tab-overview" class="tab-panel" data-panel="overview" hidden>
+        <div class="panel-card">
+          <h2>Overview</h2>
+          <p class="text-muted">Recorded activity and recent sessions from this Agent Replay storage.</p>
+          <div id="overview-metrics" class="metrics-grid"></div>
+          <h3 class="section-heading">Recent sessions</h3>
+          <div id="overview-recent" class="overview-list"><p class="text-muted">Loading overview...</p></div>
+        </div>
+      </section>
+
+      <section id="tab-playground" class="tab-panel" data-panel="playground" hidden>
+        <div class="panel-card playground-panel">
+          <h2>AI Playground</h2>
+          <p class="text-muted">Provider calls happen only when you submit. API keys remain server-side and are never recorded.</p>
+          <div id="provider-notice" class="notice-panel">Loading provider configuration...</div>
+          <div id="playground-messages" class="playground-messages"></div>
+          <div class="evaluation-controls">
+            <label class="control-group">
+              <span class="metric-label">Recorded session to evaluate</span>
+              <select id="playground-evaluation-session" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Reusable suite (optional)</span>
+              <select id="playground-evaluation-suite" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Deterministic criteria (JSON)</span>
+              <textarea id="playground-evaluation-criteria" class="prompt-input" rows="3">{"required_fields":["text"]}</textarea>
+            </label>
+            <button id="evaluate-recorded-session-btn" class="btn btn-secondary" type="button">Evaluate recorded output</button>
+            <div id="playground-evaluation-results" class="replay-results" aria-live="polite">
+              <p class="text-muted">Evaluation uses recorded output only; it does not call a provider.</p>
+            </div>
+            <h3 class="section-heading">Session evaluation history</h3>
+            <div id="playground-evaluation-history" class="experiment-history"><p class="text-muted">Select a session to view saved evaluations.</p></div>
+            <div class="suite-library">
+              <h3 class="section-heading">Reusable evaluation suites</h3>
+              <p class="text-muted">Suites are versioned. Editing creates a new version; prior results keep their original criteria snapshot.</p>
+              <label class="control-group">
+                <span class="metric-label">Starting template</span>
+                <select id="suite-template-select" class="select-input"></select>
+              </label>
+              <label class="control-group">
+                <span class="metric-label">Suite to edit or inspect</span>
+                <select id="suite-edit-select" class="select-input"></select>
+              </label>
+              <input id="suite-name-input" class="text-input" maxlength="100" placeholder="Suite name">
+              <input id="suite-description-input" class="text-input" maxlength="500" placeholder="Optional description">
+              <label class="control-group">
+                <span class="metric-label">Criteria JSON</span>
+                <textarea id="suite-criteria-input" class="prompt-input" rows="7">{"expected_output":{"answer":"expected value"}}</textarea>
+              </label>
+              <button id="save-suite-btn" class="btn btn-primary" type="button">Create suite</button>
+              <p id="suite-library-status" class="text-muted" aria-live="polite"></p>
+              <div id="suite-library-history" class="experiment-history"></div>
+            </div>
+          <form id="playground-form" class="playground-form">
+            <select id="playground-provider" class="select-input" aria-label="Provider"></select>
+            <input id="playground-model" class="text-input" placeholder="Model (optional)">
+            <textarea id="playground-prompt" class="prompt-input" rows="4" placeholder="Ask a configured provider..." required></textarea>
+            <div class="playground-actions"><button id="playground-send" class="btn btn-primary" type="submit">Send</button><button id="playground-reset" class="btn btn-secondary" type="button">Reset</button></div>
+          </form>
+        </div>
+      </section>
+
+      <section id="tab-replay-guide" class="tab-panel" data-panel="replay-guide" hidden>
+        <div class="panel-card replay-guide">
+          <h2>Replay Guide</h2>
+          <p class="text-muted">
+            Work from recorded evidence: inspect a trace, validate its recorded call sequence,
+            or create a supported controlled fork. Strict validation does not re-run an agent;
+            forks only substitute eligible recorded tool responses.
+          </p>
+
+          <section class="guide-step">
+            <h3>1. Select a recorded session</h3>
+            <label class="control-group">
+              <span class="metric-label">Session</span>
+              <select id="replay-guide-session" class="select-input" aria-label="Replay Guide session"></select>
+            </label>
+            <div id="replay-guide-session-status" class="notice-panel" aria-live="polite">
+              Loading recorded sessions...
+            </div>
+            <button id="replay-guide-open-trace" class="btn btn-secondary" type="button" disabled>
+              Inspect ordered trace
+            </button>
+          </section>
+
+          <section class="guide-step">
+            <h3>2. Validate the recorded sequence</h3>
+            <p class="text-muted">
+              Strict replay checks the recorded event sequence and arguments against persisted
+              results. It does not call a provider or execute the agent again.
+            </p>
+            <button id="replay-guide-validate" class="btn btn-primary" type="button" disabled>
+              Validate recorded replay
+            </button>
+            <div id="replay-guide-validation-result" class="replay-results" aria-live="polite">
+              <p class="text-muted">No validation run from this guide yet.</p>
+            </div>
+            <h4 class="section-heading">Saved validation history</h4>
+            <div id="replay-guide-validation-history" class="experiment-history">
+              <p class="text-muted">Select a session to inspect its saved validations.</p>
+            </div>
+          </section>
+
+          <section class="guide-step">
+            <h3>3. Configure a controlled fork</h3>
+            <p id="replay-guide-fork-explanation" class="text-muted">
+              Forking is limited to a supported recorded account workflow and its eligible event.
+              The baseline remains unchanged.
+            </p>
+            <label class="control-group">
+              <span class="metric-label">Eligible substitution event</span>
+              <select id="replay-guide-event" class="select-input" disabled></select>
+            </label>
+            <label class="control-group guide-value">
+              <span class="metric-label">Recorded event result</span>
+              <pre id="replay-guide-recorded-value" class="code-block">Unavailable</pre>
+            </label>
+            <label class="control-group guide-value">
+              <span class="metric-label">Proposed replacement result (JSON)</span>
+              <textarea id="replay-guide-substitute" class="prompt-input" rows="4">{"status":"ok","balance":500.0}</textarea>
+            </label>
+            <p class="text-muted">
+              The server validates the replacement. The fork reuses the existing controlled
+              scenario workflow; it is not arbitrary agent-graph execution.
+            </p>
+            <button id="replay-guide-run-fork" class="btn btn-primary" type="button" disabled>
+              Create and compare fork
+            </button>
+            <div id="replay-guide-fork-status" class="notice-panel" aria-live="polite">
+              A supported baseline is required before a fork can be created.
+            </div>
+          </section>
+
+          <section class="guide-step">
+            <h3>4. Review and revisit results</h3>
+            <p class="text-muted">
+              Compare saved baseline and fork evidence in Experiments. Evaluation suites and
+              criterion-level evidence are available there when you evaluate a saved comparison.
+              Unrecorded usage or cost remains unavailable.
+            </p>
+            <div class="guide-actions">
+              <button id="replay-guide-evaluate-session" class="btn btn-secondary" type="button" disabled>
+                Evaluate selected recorded session
+              </button>
+              <button id="replay-guide-open-experiments" class="btn btn-secondary" type="button">
+                Open saved comparisons and evaluations
+              </button>
+              <button id="replay-guide-open-replay" class="btn btn-secondary" type="button">
+                Open replay validation history
+              </button>
+            </div>
+          </section>
+        </div>
+      </section>
+
       <section id="tab-replay" class="tab-panel" data-panel="replay" hidden>
         <div class="panel-card">
           <h2>Replay</h2>
@@ -168,7 +298,7 @@
               <select id="replay-session-select" class="select-input"></select>
             </label>
             <label class="control-group">
-              <span class="metric-label">Mode</span>
+              <span class="metric-label">Mode (Strict validates the trace; it does not rerun an agent)</span>
               <select id="replay-mode-select" class="select-input">
                 <option value="strict">Strict</option>
                 <option value="forked">Forked</option>
@@ -179,43 +309,104 @@
           <div id="replay-results" class="replay-results">
             <p class="text-muted">Select a session and run replay to inspect each event.</p>
           </div>
+          <h3 class="section-heading">Strict replay validation history</h3>
+          <div id="replay-validation-history" class="experiment-history"><p class="text-muted">Select a session to view validation attempts.</p></div>
         </div>
       </section>
 
       <section id="tab-experiment" class="tab-panel" data-panel="experiment" hidden>
         <div class="panel-card">
-          <h2>Deterministic counterfactual experiment</h2>
+          <h2>Guided experiment comparison</h2>
           <p class="text-muted">
-            Runs the local failure workflow, strict replay, and a fork that substitutes the
-            account response. No model provider is used.
+            Choose a supported recorded account-workflow session, then provide a substitute
+            response for its first tool event. Strict replay reconstructs the baseline without
+            executing downstream tools; the fork executes the supported workflow after substitution.
           </p>
-          <button id="run-experiment-btn" class="btn btn-primary">Run experiment</button>
-          <div id="experiment-results" class="replay-results">
-            <p class="text-muted">Run the experiment to compare the baseline and fork.</p>
+          <div class="experiment-controls">
+            <label class="control-group">
+              <span class="metric-label">Baseline session</span>
+              <select id="experiment-baseline-select" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Substitution event</span>
+              <select id="experiment-event-select" class="select-input"></select>
+            </label>
+            <label class="control-group experiment-result-input">
+              <span class="metric-label">Replacement tool response (JSON)</span>
+              <textarea id="experiment-result-input" class="prompt-input" rows="4">{"status":"ok","balance":500.0}</textarea>
+            </label>
+            <label class="control-group experiment-result-input">
+              <span class="metric-label">Reusable evaluation suite (optional)</span>
+              <select id="experiment-suite-select" class="select-input"></select>
+            </label>
+            <button id="run-experiment-btn" class="btn btn-primary">Run comparison</button>
           </div>
+          <div class="evaluation-controls">
+            <label class="control-group">
+              <span class="metric-label">Evaluation criteria for both runs (JSON)</span>
+              <textarea id="experiment-evaluation-criteria" class="prompt-input" rows="4">{"expected_output":{"credit_limit":1250.0},"required_fields":["credit_limit"]}</textarea>
+            </label>
+            <button id="evaluate-experiment-btn" class="btn btn-secondary" type="button" disabled>Evaluate baseline and fork</button>
+            <div id="experiment-evaluation-results" class="replay-results" aria-live="polite">
+              <p class="text-muted">Run or open a saved comparison before evaluating it.</p>
+            </div>
+            <h3 class="section-heading">Evaluation history</h3>
+            <div id="experiment-evaluation-history" class="experiment-history"><p class="text-muted">No evaluation selected.</p></div>
+          </div>
+          <div id="experiment-results" class="replay-results">
+            <p class="text-muted">Select an eligible session above. Experiment runs are saved and can be reopened here.</p>
+          </div>
+          <h3 class="section-heading">Saved comparisons</h3>
+          <div id="experiment-history" class="experiment-history"><p class="text-muted">Loading comparisons...</p></div>
         </div>
       </section>
 
       <section id="tab-live" class="tab-panel" data-panel="live" hidden>
         <div class="panel-card">
-          <h2>Live Run</h2>
-          <p class="text-muted">Execute a server-defined agent scenario with a 5-step cap and safe internal timeout.</p>
+          <h2>Live monitoring & supported runs</h2>
+          <p id="live-capability-status" class="notice-panel">Loading server capability status...</p>
+          <p class="text-muted">Model-only runs make one bounded provider call; they do not execute tools or arbitrary agent graphs. Provider keys stay on the server. Runs are recorded as sessions and can be evaluated or replay-validated when evidence supports it.</p>
+          <div class="live-model-run-form">
+            <label class="control-group">
+              <span class="metric-label">Configured provider</span>
+              <select id="live-provider-select" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Configured model</span>
+              <select id="live-model-select" class="select-input"></select>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Task prompt (maximum 8,000 characters)</span>
+              <textarea id="live-task-prompt" class="prompt-input" rows="4" maxlength="8000" placeholder="Enter a single model task..." required></textarea>
+            </label>
+            <label class="control-group">
+              <span class="metric-label">Remote execution token (not saved)</span>
+              <input id="live-auth-token" class="text-input" type="password" autocomplete="off" placeholder="Only required when calling a remote server">
+            </label>
+            <button id="launch-live-model-btn" class="btn btn-primary" type="button" disabled>Start model-only run</button>
+          </div>
           <div class="live-run-toolbar">
             <label class="control-group">
-              <span class="metric-label">Select Scenario</span>
+              <span class="metric-label">Legacy fixed scenario (local/trusted only)</span>
               <select id="live-scenario-select" class="select-input">
                 <option value="">Loading scenarios...</option>
               </select>
             </label>
-            <button id="run-live-btn" class="btn btn-primary">Run Live Scenario</button>
+            <button id="run-live-btn" class="btn btn-primary">Run supported scenario</button>
           </div>
           <div id="live-run-status" class="live-run-status hidden"></div>
+          <h3 class="section-heading">Recent model runs</h3>
+          <div id="live-run-history" class="overview-list"><p class="text-muted">Loading live run history...</p></div>
+          <p class="text-muted">The monitor refreshes persisted sessions and run status periodically. It does not stream provider tokens; the current run's event is persisted before its provider request and finalized when the call returns.</p>
+          <h3 class="section-heading">Recent recorded activity</h3>
+          <div id="live-recent-sessions" class="overview-list"><p class="text-muted">Loading recorded activity...</p></div>
         </div>
       </section>
 
       <section id="tab-cost" class="tab-panel" data-panel="cost" hidden>
         <div class="panel-card">
           <h2>Model usage & costs</h2>
+          <p class="text-muted">Costs are estimates from configured model rates unless explicitly marked otherwise; Agent Replay does not receive provider-confirmed billing totals here. Missing usage or pricing is shown as unavailable.</p>
           <div class="usage-filters">
             <label class="control-group">
               <span class="metric-label">Provider</span>
@@ -242,10 +433,11 @@
               <thead>
                 <tr>
                   <th>Provider / model</th>
-                  <th>Sessions</th>
+                  <th>Session / execution</th>
+                  <th>Events</th>
                   <th>Input tokens</th>
                   <th>Output tokens</th>
-                  <th>Cost</th>
+                  <th>Cost / status</th>
                 </tr>
               </thead>
               <tbody id="usage-table-body"></tbody>
