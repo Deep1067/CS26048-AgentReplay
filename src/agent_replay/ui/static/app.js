@@ -1,4 +1,7 @@
 document.addEventListener("DOMContentLoaded", () => {
+  const googleFonts = document.getElementById("google-fonts");
+  if (googleFonts) googleFonts.media = "all";
+
   let allSessions = [];
   let currentSessionData = null;
   let replayGuideSession = null;
@@ -69,9 +72,11 @@ document.addEventListener("DOMContentLoaded", () => {
   const pricingExchangeNote = document.getElementById("pricing-exchange-note");
   const pricingTableBody = document.getElementById("pricing-table-body");
   const savePricingBtn = document.getElementById("save-pricing-btn");
+  const pricingAuthToken = document.getElementById("pricing-auth-token");
   const costHistoryEl = document.getElementById("cost-history");
   const detectorConfigForm = document.getElementById("detector-config-form");
   const saveDetectorBtn = document.getElementById("save-detector-btn");
+  const detectorAuthToken = document.getElementById("detector-auth-token");
   const detectorConfigStatus = document.getElementById("detector-config-status");
   const liveScenarioSelect = document.getElementById("live-scenario-select");
   const runLiveBtn = document.getElementById("run-live-btn");
@@ -662,6 +667,11 @@ document.addEventListener("DOMContentLoaded", () => {
       liveMonitorTimer = null;
     }
     if (tabName === "detector") fetchDetectorConfig();
+    if (tabName === "replay") fetchReplayValidationHistory(replaySessionSelect.value);
+    if (tabName === "replay-guide") refreshReplayGuide(currentSessionData);
+    if (tabName === "playground" && playgroundEvaluationSession.value) {
+      fetchSessionEvaluationHistory(playgroundEvaluationSession.value);
+    }
   }
 
   async function fetchUsage() {
@@ -834,7 +844,7 @@ document.addEventListener("DOMContentLoaded", () => {
       playgroundMessages.appendChild(userMessage);
       try {
         const headers = {"Content-Type": "application/json"};
-        if (liveAuthToken.value) headers.Authorization = `Bearer ${liveAuthToken.value}`;
+        if (liveAuthToken.value) headers["X-Live-Run-Token"] = liveAuthToken.value;
         const response = await fetch("/api/playground/chat", {
           method: "POST",
           headers,
@@ -957,9 +967,13 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     try {
       saveDetectorBtn.disabled = true;
+      const headers = { "Content-Type": "application/json" };
+      if (detectorAuthToken.value) {
+        headers["X-Config-Mutations-Token"] = detectorAuthToken.value;
+      }
       const res = await fetch("/api/detector-config", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify(config),
       });
       const data = await res.json();
@@ -1018,9 +1032,13 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     try {
       savePricingBtn.disabled = true;
+      const headers = { "Content-Type": "application/json" };
+      if (pricingAuthToken.value) {
+        headers["X-Config-Mutations-Token"] = pricingAuthToken.value;
+      }
       const res = await fetch("/api/prices", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ models }),
       });
       const data = await res.json();
@@ -1082,7 +1100,7 @@ document.addEventListener("DOMContentLoaded", () => {
       option.value = "";
       option.textContent = "No recorded sessions";
       replayGuideSessionSelect.appendChild(option);
-      refreshReplayGuide();
+      if (tabPanelsActive("replay-guide")) refreshReplayGuide();
       return;
     }
     sessions.forEach(session => {
@@ -1095,7 +1113,11 @@ document.addEventListener("DOMContentLoaded", () => {
     replayGuideSessionSelect.value = sessions.some(session => session.session_id === selected)
       ? selected
       : sessions[0].session_id;
-    refreshReplayGuide();
+    if (tabPanelsActive("replay-guide")) refreshReplayGuide(currentSessionData);
+  }
+
+  function tabPanelsActive(tabName) {
+    return document.querySelector(`[data-panel="${tabName}"]`)?.classList.contains("active") || false;
   }
 
   function renderReplayGuideValidation(validation) {
@@ -1135,7 +1157,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  async function refreshReplayGuide() {
+  async function refreshReplayGuide(loadedSession = null) {
     const sessionId = replayGuideSessionSelect.value;
     replayGuideSession = null;
     replayGuideBaseline = null;
@@ -1155,19 +1177,27 @@ document.addEventListener("DOMContentLoaded", () => {
     replayGuideSessionStatus.textContent = sessionId
       ? "Loading session and operation eligibility..."
       : "No recorded session is available. Record or load a session first.";
-    loadReplayGuideValidationHistory(sessionId);
-    if (!sessionId) return;
+    if (!sessionId) {
+      await loadReplayGuideValidationHistory(sessionId);
+      return;
+    }
+    replayGuideValidationHistory.textContent = "Loading saved validation history...";
 
     try {
-      const [sessionResponse, baselineResponse] = await Promise.all([
-        fetch(`/api/sessions/${encodeURIComponent(sessionId)}`),
+      const sessionRequest = loadedSession?.session_id === sessionId
+        ? Promise.resolve(loadedSession)
+        : fetch(`/api/sessions/${encodeURIComponent(sessionId)}`).then(async response => {
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.detail || "Unable to load the selected session.");
+          }
+          return data;
+        });
+      const [sessionData, baselineResponse] = await Promise.all([
+        sessionRequest,
         fetch("/api/experiments/baselines"),
       ]);
-      const sessionData = await sessionResponse.json();
       const baselineData = await baselineResponse.json();
-      if (!sessionResponse.ok) {
-        throw new Error(sessionData.detail || "Unable to load the selected session.");
-      }
       if (!baselineResponse.ok) {
         throw new Error(baselineData.detail || "Unable to check fork eligibility.");
       }
@@ -1294,7 +1324,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if (currentSessionData) {
       replaySessionSelect.value = currentSessionData.session_id;
     }
-    fetchReplayValidationHistory(replaySessionSelect.value);
+    if (tabPanelsActive("replay")) {
+      fetchReplayValidationHistory(replaySessionSelect.value);
+    }
   }
 
   async function fetchReplayValidationHistory(sessionId) {
@@ -1655,8 +1687,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     sessions.forEach(sess => {
-      const item = document.createElement("div");
-      item.className = `session-item ${currentSessionData && currentSessionData.session_id === sess.session_id ? 'active' : ''}`;
+      const item = document.createElement("button");
+      item.type = "button";
+      const isActive = currentSessionData && currentSessionData.session_id === sess.session_id;
+      item.className = `session-item ${isActive ? 'active' : ''}`;
+      if (isActive) item.setAttribute("aria-current", "true");
 
       const dateStr = sess.started_at ? new Date(sess.started_at).toLocaleTimeString() : "";
       const header = document.createElement("div");
@@ -1682,12 +1717,14 @@ document.addEventListener("DOMContentLoaded", () => {
       footer.append(eventMeta, cost);
       item.append(header, footer);
 
-      item.addEventListener("click", () => selectSession(sess.session_id));
+      item.addEventListener("click", event =>
+        selectSession(sess.session_id, event.detail === 0)
+      );
       sessionsListEl.appendChild(item);
     });
   }
 
-  async function selectSession(sessionId) {
+  async function selectSession(sessionId, restorePickerFocus = false) {
     try {
       document.querySelectorAll(".session-item").forEach(el => el.classList.remove("active"));
       const res = await fetch(`/api/sessions/${sessionId}`);
@@ -1696,12 +1733,16 @@ document.addEventListener("DOMContentLoaded", () => {
       replaySessionSelect.value = sessionId;
       if ([...replayGuideSessionSelect.options].some(option => option.value === sessionId)) {
         replayGuideSessionSelect.value = sessionId;
-        refreshReplayGuide();
+        if (tabPanelsActive("replay-guide")) refreshReplayGuide(currentSessionData);
       }
-      fetchReplayValidationHistory(sessionId);
+      if (tabPanelsActive("replay")) {
+        fetchReplayValidationHistory(sessionId);
+      }
       if ([...playgroundEvaluationSession.options].some(option => option.value === sessionId)) {
         playgroundEvaluationSession.value = sessionId;
-        if (loadSessionEvaluationHistory) loadSessionEvaluationHistory(sessionId);
+        if (tabPanelsActive("playground") && loadSessionEvaluationHistory) {
+          loadSessionEvaluationHistory(sessionId);
+        }
       }
       sessionContext.textContent = `Session: ${sessionId}`;
       sessionContext.disabled = false;
@@ -1713,6 +1754,9 @@ document.addEventListener("DOMContentLoaded", () => {
       renderFlags(currentSessionData.flags || []);
       renderTimeline(currentSessionData.events || [], currentSessionData.flags || []);
       renderSessionsList(allSessions);
+      if (restorePickerFocus) {
+        sessionsListEl.querySelector('.session-item[aria-current="true"]')?.focus();
+      }
       return true;
     } catch (err) {
       alert("Error loading session: " + err.message);
@@ -1793,7 +1837,9 @@ document.addEventListener("DOMContentLoaded", () => {
       const empty = document.createElement("div");
       empty.className = "empty-state";
       empty.style.height = "150px";
-      empty.textContent = "No events match filter.";
+      empty.textContent = events.length
+        ? "No events match the current filters."
+        : "No events recorded in this session.";
       timelineEventsEl.appendChild(empty);
       return;
     }
@@ -2016,7 +2062,7 @@ document.addEventListener("DOMContentLoaded", () => {
       liveRunStatusEl.classList.remove("hidden");
 
       const headers = { "Content-Type": "application/json" };
-      if (liveAuthToken.value) headers.Authorization = `Bearer ${liveAuthToken.value}`;
+      if (liveAuthToken.value) headers["X-Live-Run-Token"] = liveAuthToken.value;
       const res = await fetch("/api/live/run", {
         method: "POST",
         headers,
@@ -2073,7 +2119,7 @@ document.addEventListener("DOMContentLoaded", () => {
     liveRunStatusEl.textContent = "Queuing one bounded provider model call...";
     liveRunStatusEl.classList.remove("hidden");
     const headers = { "Content-Type": "application/json" };
-    if (liveAuthToken.value) headers.Authorization = `Bearer ${liveAuthToken.value}`;
+    if (liveAuthToken.value) headers["X-Live-Run-Token"] = liveAuthToken.value;
 
     try {
       const response = await fetch("/api/live/runs", {

@@ -36,6 +36,19 @@ class SessionSummary:
     total_cost_usd: float = 0.0
     total_duration_ms: float = 0.0
     has_errors: bool = False
+    model_total_cost_usd: float | None = None
+    cost_status: Literal["actual", "estimated", "unavailable"] = "unavailable"
+    model_call_count: int = 0
+    missing_model_usage_count: int = 0
+    successful_events: int = 0
+    failed_events: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+            "event_count": self.event_count,
+            "total_cost_usd": self.total_cost_usd,
+            "total_duration_ms": self.total_duration_ms,
+            "has_errors": self.has_errors,
+        }

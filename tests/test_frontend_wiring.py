@@ -48,6 +48,50 @@ def test_visual_system_respects_focus_and_reduced_motion():
     assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in css
 
 
+def test_session_picker_is_keyboard_accessible():
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'const item = document.createElement("button")' in source
+    assert 'item.type = "button"' in source
+    assert 'item.setAttribute("aria-current", "true")' in source
+    assert "selectSession(sess.session_id, event.detail === 0)" in source
+    assert (
+        "sessionsListEl.querySelector('.session-item[aria-current=\"true\"]')?.focus();" in source
+    )
+
+
+def test_external_fonts_do_not_block_initial_script_loading():
+    html = APP_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="google-fonts"' in html
+    assert 'rel="stylesheet" media="print"' in html
+    assert 'document.getElementById("google-fonts")' in source
+    assert 'googleFonts.media = "all"' in source
+
+
+def test_privileged_tokens_are_transient_and_use_separate_headers():
+    html = APP_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="live-auth-token"' in html
+    assert 'id="pricing-auth-token"' in html
+    assert 'id="detector-auth-token"' in html
+    assert 'headers["X-Live-Run-Token"]' in source
+    assert 'headers["X-Config-Mutations-Token"]' in source
+    assert "localStorage.setItem('live-auth-token'" not in source
+    assert "localStorage.setItem('pricing-auth-token'" not in source
+    assert "localStorage.setItem('detector-auth-token'" not in source
+
+
+def test_timeline_distinguishes_empty_sessions_from_filtered_results():
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert "events.length" in source
+    assert '"No events recorded in this session."' in source
+    assert '"No events match the current filters."' in source
+
+
 def test_experiment_and_playground_have_recorded_output_evaluation_controls():
     html = APP_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
@@ -78,6 +122,30 @@ def test_replay_history_and_versioned_suite_selectors_are_connected():
     assert "loadExperimentEvaluations(data.experiment_id)" in source
     assert "loadSessionEvaluationHistory(sessionId)" in source
     assert "not comparable:" in source
+
+
+def test_session_selection_defers_hidden_history_and_reuses_loaded_trace():
+    source = APP_JS.read_text(encoding="utf-8")
+    replay_sessions = source.split("function populateReplaySessions(sessions) {", 1)[1].split(
+        "async function fetchReplayValidationHistory", 1
+    )[0]
+    replay_guide_sessions = source.split("function populateReplayGuide(sessions) {", 1)[1].split(
+        "function renderReplayGuideValidation", 1
+    )[0]
+    selection = source.split("async function selectSession(", 1)[1].split(
+        "function renderSessionMetrics", 1
+    )[0]
+
+    assert 'if (tabPanelsActive("replay"))' in replay_sessions
+    assert 'if (tabPanelsActive("replay-guide")) refreshReplayGuide(currentSessionData)' in (
+        replay_guide_sessions
+    )
+    assert 'if (tabPanelsActive("replay")) {' in selection
+    assert 'if (tabPanelsActive("replay-guide")) refreshReplayGuide(currentSessionData)' in (
+        selection
+    )
+    assert "async function refreshReplayGuide(loadedSession = null)" in source
+    assert "const sessionRequest = loadedSession?.session_id === sessionId" in source
 
 
 def test_live_model_run_form_polls_persisted_runs_and_links_to_sessions():

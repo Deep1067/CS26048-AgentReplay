@@ -1,14 +1,25 @@
 import asyncio
 import json
+import threading
+import time
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_replay.api import create_app
+from agent_replay.api import ScenarioCancelled, create_app
 from agent_replay.models import Event
 from agent_replay.providers import ProviderResponse
 from agent_replay.storage import SQLiteStorage
+
+
+@pytest.fixture(autouse=True)
+def local_privileged_test_mode(monkeypatch):
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("APP_AUTH_USERNAME", raising=False)
+    monkeypatch.delenv("APP_AUTH_PASSWORD", raising=False)
+    monkeypatch.setenv("ALLOW_LOOPBACK_PRIVILEGED_ACTIONS", "true")
 
 
 class _RemoteClient:
@@ -68,6 +79,356 @@ def test_api_list_sessions(client):
     assert len(data) == 1
     assert data[0]["session_id"] == "sess_api_test"
     assert data[0]["event_count"] == 1
+
+
+def test_session_summaries_use_one_query_and_preserve_metrics():
+    storage = SQLiteStorage(db_path=":memory:")
+    storage.create_session("summary-empty")
+
+    fixtures = (
+        Event(
+            session_id="summary-actual",
+            seq=1,
+            type="model_call",
+            name="mock-model",
+            args_json="{}",
+            result_json="{}",
+            started_at="2026-01-01T00:00:00+00:00",
+            duration_ms=2,
+            tokens_in=10,
+            tokens_out=5,
+            tokens_total=15,
+            cost_usd=0.001,
+            cost_status="actual",
+        ),
+        Event(
+            session_id="summary-estimated",
+            seq=1,
+            type="model_call",
+            name="mock-model",
+            args_json="{}",
+            result_json="{}",
+            started_at="2026-01-01T00:00:01+00:00",
+            duration_ms=3,
+            tokens_in=10,
+            tokens_out=5,
+            tokens_total=15,
+            cost_usd=0.0005,
+            cost_status="estimated",
+        ),
+        Event(
+            session_id="summary-unavailable",
+            seq=1,
+            type="model_call",
+            name="mock-model",
+            args_json="{}",
+            result_json="{}",
+            started_at="2026-01-01T00:00:02+00:00",
+            duration_ms=4,
+            cost_status="unavailable",
+        ),
+        Event(
+            session_id="summary-legacy-estimated",
+            seq=1,
+            type="model_call",
+            name="mock-model",
+            args_json="{}",
+            result_json="{}",
+            started_at="2026-01-01T00:00:03+00:00",
+            duration_ms=5,
+            tokens_in=10,
+            tokens_out=5,
+            tokens_total=15,
+            cost_usd=0.002,
+            cost_status="unavailable",
+        ),
+        Event(
+            session_id="summary-failed-tool",
+            seq=1,
+            type="tool_call",
+            name="mock-tool",
+            args_json="{}",
+            error="Synthetic failure.",
+            started_at="2026-01-01T00:00:04+00:00",
+            duration_ms=6,
+        ),
+    )
+    for event in fixtures:
+        storage.create_session(event.session_id)
+        storage.save_event(event)
+
+    session_start_times = {
+        "summary-empty": "2026-01-01T00:00:00+00:00",
+        "summary-actual": "2026-01-01T00:00:01+00:00",
+        "summary-estimated": "2026-01-01T00:00:02+00:00",
+        "summary-unavailable": "2026-01-01T00:00:03+00:00",
+        "summary-legacy-estimated": "2026-01-01T00:00:04+00:00",
+        "summary-failed-tool": "2026-01-01T00:00:05+00:00",
+    }
+    with storage._conn:
+        storage._conn.executemany(
+            "UPDATE sessions SET started_at = ? WHERE session_id = ?;",
+            [(started_at, session_id) for session_id, started_at in session_start_times.items()],
+        )
+
+    client = TestClient(create_app(storage=storage))
+
+    def request_with_select_count(path):
+        statements = []
+        storage._conn.set_trace_callback(
+            lambda statement: statements.append(statement.lstrip().split(None, 1)[0].upper())
+        )
+        try:
+            response = client.get(path)
+        finally:
+            storage._conn.set_trace_callback(None)
+        return response, sum(statement in {"SELECT", "WITH"} for statement in statements)
+
+    sessions_response, session_select_count = request_with_select_count("/api/sessions")
+    assert session_select_count == 1
+    sessions = {item["session_id"]: item for item in sessions_response.json()}
+    assert sessions["summary-actual"]["total_cost_usd"] == 0.001
+    assert sessions["summary-actual"]["cost_status"] == "actual"
+    assert sessions["summary-estimated"]["total_cost_usd"] == 0.0005
+    assert sessions["summary-estimated"]["cost_status"] == "estimated"
+    assert sessions["summary-legacy-estimated"]["total_cost_usd"] == 0.002
+    assert sessions["summary-legacy-estimated"]["cost_status"] == "estimated"
+    assert sessions["summary-unavailable"]["total_cost_usd"] is None
+    assert sessions["summary-unavailable"]["cost_status"] == "unavailable"
+    assert sessions["summary-empty"]["event_count"] == 0
+    assert sessions["summary-empty"]["cost_status"] == "unavailable"
+
+    overview_response, overview_select_count = request_with_select_count("/api/overview")
+    assert overview_select_count == 1
+    overview = overview_response.json()
+    assert overview["session_count"] == 6
+    assert overview["event_count"] == 5
+    assert overview["successful_events"] == 4
+    assert overview["failed_events"] == 1
+    assert overview["total_duration_ms"] == 20
+    assert overview["model_usage_available"] is False
+    recent = {item["session_id"]: item for item in overview["recent_sessions"]}
+    assert len(recent) == 5
+    assert "summary-empty" not in recent
+    assert recent["summary-actual"]["total_cost_usd"] == 0.001
+    assert recent["summary-unavailable"]["total_cost_usd"] is None
+
+
+def test_application_auth_protects_ui_and_api_but_not_health(monkeypatch):
+    password = "test-only-password-with-sufficient-length"
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("APP_AUTH_USERNAME", "release-operator")
+    monkeypatch.setenv("APP_AUTH_PASSWORD", password)
+    app = create_app(storage=SQLiteStorage(db_path=":memory:"))
+    client = TestClient(app)
+
+    unauthenticated = client.get("/api/sessions")
+    invalid = client.get("/api/sessions", auth=("release-operator", "wrong-password"))
+    authenticated = client.get("/api/sessions", auth=("release-operator", password))
+
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.headers["www-authenticate"].startswith("Basic ")
+    assert invalid.status_code == 401
+    assert authenticated.status_code == 200
+    assert client.get("/").status_code == 401
+    assert client.get("/healthz").json() == {"status": "ok"}
+    assert client.get("/readyz").json() == {
+        "status": "ready",
+        "storage": "available",
+    }
+
+
+def test_application_auth_and_privileged_tokens_are_independent(monkeypatch, tmp_path):
+    from agent_replay import api as api_module
+    from agent_replay.pricing import PriceEngine
+
+    password = "test-only-password-with-sufficient-length"
+    price_engine = PriceEngine(tmp_path / "prices.json")
+    monkeypatch.setattr(api_module, "get_price_engine", lambda: price_engine)
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("APP_AUTH_USERNAME", "release-operator")
+    monkeypatch.setenv("APP_AUTH_PASSWORD", password)
+    monkeypatch.setenv("CONFIG_MUTATIONS_AUTH_TOKEN", "configured-admin-token")
+    app = create_app(
+        storage=SQLiteStorage(db_path=":memory:"),
+        config_mutations_enabled=True,
+    )
+    client = TestClient(app)
+    update = {
+        "models": {
+            "test-model": {
+                "input_inr_per_1k": 1,
+                "output_inr_per_1k": 1,
+            }
+        }
+    }
+
+    unauthenticated = client.put(
+        "/api/prices",
+        headers={"X-Config-Mutations-Token": "configured-admin-token"},
+        json=update,
+    )
+    missing_admin_token = client.put(
+        "/api/prices",
+        auth=("release-operator", password),
+        json=update,
+    )
+    authorized = client.put(
+        "/api/prices",
+        auth=("release-operator", password),
+        headers={"X-Config-Mutations-Token": "configured-admin-token"},
+        json=update,
+    )
+
+    assert unauthenticated.status_code == 401
+    assert missing_admin_token.status_code == 401
+    assert authorized.status_code == 200
+    assert authorized.json()["models"]["test-model"]["input_inr_per_1k"] == 1
+
+
+def test_application_auth_and_live_token_work_together(monkeypatch):
+    username = "release-operator"
+    password = "test-only-password-with-sufficient-length"
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("APP_AUTH_USERNAME", username)
+    monkeypatch.setenv("APP_AUTH_PASSWORD", password)
+    monkeypatch.setenv("LIVE_RUN_AUTH_TOKEN", "configured-provider-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "server-only-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "mock-live-model")
+    monkeypatch.setattr(
+        "agent_replay.api.call_provider",
+        lambda provider, prompt, model: ProviderResponse("mocked", provider, model),
+    )
+    client = TestClient(
+        create_app(storage=SQLiteStorage(db_path=":memory:"), live_run_enabled=True)
+    )
+
+    missing_provider_token = client.post(
+        "/api/live/runs",
+        auth=(username, password),
+        json={"provider": "openai", "prompt": "task"},
+    )
+    invalid_application_credentials = client.post(
+        "/api/live/runs",
+        auth=(username, "invalid-password"),
+        headers={"X-Live-Run-Token": "configured-provider-token"},
+        json={"provider": "openai", "prompt": "task"},
+    )
+    authorized = client.post(
+        "/api/live/runs",
+        auth=(username, password),
+        headers={"X-Live-Run-Token": "configured-provider-token"},
+        json={"provider": "openai", "prompt": "task"},
+    )
+
+    assert missing_provider_token.status_code == 401
+    assert invalid_application_credentials.status_code == 401
+    assert authorized.status_code == 202
+
+
+def test_vercel_never_uses_loopback_privileged_action_override(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("APP_AUTH_USERNAME", "release-operator")
+    monkeypatch.setenv("APP_AUTH_PASSWORD", "test-only-password-with-sufficient-length")
+    monkeypatch.setenv("ALLOW_LOOPBACK_PRIVILEGED_ACTIONS", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "server-only-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "mock-live-model")
+    client = TestClient(
+        create_app(storage=SQLiteStorage(db_path=":memory:"), live_run_enabled=True)
+    )
+
+    response = client.post(
+        "/api/live/runs",
+        auth=("release-operator", "test-only-password-with-sufficient-length"),
+        json={"provider": "openai", "prompt": "task"},
+    )
+
+    assert response.status_code == 503
+    assert "LIVE_RUN_AUTH_TOKEN" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected_message"),
+    [
+        (
+            {"VERCEL": "1"},
+            "APP_AUTH_USERNAME and APP_AUTH_PASSWORD are required on Vercel.",
+        ),
+        (
+            {"APP_AUTH_USERNAME": "operator"},
+            "APP_AUTH_USERNAME and APP_AUTH_PASSWORD must be configured together.",
+        ),
+        (
+            {
+                "APP_AUTH_USERNAME": "operator",
+                "APP_AUTH_PASSWORD": "short",
+            },
+            "APP_AUTH_PASSWORD must be at least 24 characters long.",
+        ),
+    ],
+)
+def test_application_auth_configuration_fails_closed(monkeypatch, environment, expected_message):
+    for name in ("VERCEL", "APP_AUTH_USERNAME", "APP_AUTH_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        create_app(storage=SQLiteStorage(db_path=":memory:"))
+
+
+def test_health_and_readiness_do_not_expose_storage_errors():
+    storage = SQLiteStorage(db_path=":memory:")
+
+    def fail_health_check():
+        raise RuntimeError("libsql://private-host auth_token=private-value")
+
+    storage.check_health = fail_health_check
+    client = TestClient(create_app(storage=storage))
+
+    health = client.get("/healthz")
+    readiness = client.get("/readyz")
+
+    assert health.status_code == 200
+    assert readiness.status_code == 503
+    assert readiness.json() == {"detail": "Storage is unavailable."}
+    assert "private" not in readiness.text
+
+
+def test_loopback_and_forwarded_headers_do_not_bypass_privileged_token(monkeypatch):
+    monkeypatch.delenv("ALLOW_LOOPBACK_PRIVILEGED_ACTIONS", raising=False)
+    monkeypatch.delenv("LIVE_RUN_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "server-only-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "mock-live-model")
+    client = TestClient(
+        create_app(storage=SQLiteStorage(db_path=":memory:"), live_run_enabled=True)
+    )
+    headers = {"X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1"}
+
+    missing = client.post(
+        "/api/live/runs",
+        headers=headers,
+        json={"provider": "openai", "prompt": "task"},
+    )
+    monkeypatch.setenv("LIVE_RUN_AUTH_TOKEN", "configured-provider-token")
+    invalid = client.post(
+        "/api/live/runs",
+        headers={**headers, "Authorization": "Bearer invalid"},
+        json={"provider": "openai", "prompt": "task"},
+    )
+    monkeypatch.setattr(
+        "agent_replay.api.call_provider",
+        lambda provider, prompt, model: ProviderResponse("mocked", provider, model),
+    )
+    authorized = client.post(
+        "/api/live/runs",
+        headers={**headers, "Authorization": "Bearer configured-provider-token"},
+        json={"provider": "openai", "prompt": "task"},
+    )
+
+    assert missing.status_code == 503
+    assert invalid.status_code == 401
+    assert authorized.status_code == 202
 
 
 def test_api_get_session_details(client):
@@ -532,6 +893,7 @@ def test_api_updates_prices_in_inr(tmp_path, monkeypatch):
 
     engine = PriceEngine(tmp_path / "prices.json")
     monkeypatch.setattr(api_module, "get_price_engine", lambda: engine)
+    monkeypatch.setenv("CONFIG_MUTATIONS_AUTH_TOKEN", "test-admin-token")
     app = create_app(
         storage=SQLiteStorage(db_path=":memory:"),
         config_mutations_enabled=True,
@@ -540,6 +902,7 @@ def test_api_updates_prices_in_inr(tmp_path, monkeypatch):
 
     res = test_client.put(
         "/api/prices",
+        headers={"X-Config-Mutations-Token": "test-admin-token"},
         json={"models": {"test-model": {"input_inr_per_1k": 8.3, "output_inr_per_1k": 16.6}}},
     )
 
@@ -555,6 +918,7 @@ def test_api_updates_detector_config(tmp_path, monkeypatch):
     from agent_replay.detector import config as detector_config
 
     monkeypatch.setattr(detector_config, "DETECTOR_CONFIG_PATH", tmp_path / "detector.json")
+    monkeypatch.setenv("CONFIG_MUTATIONS_AUTH_TOKEN", "test-admin-token")
     app = create_app(
         storage=SQLiteStorage(db_path=":memory:"),
         config_mutations_enabled=True,
@@ -568,7 +932,11 @@ def test_api_updates_detector_config(tmp_path, monkeypatch):
         "max_events_per_session": 40,
     }
 
-    res = test_client.put("/api/detector-config", json=update)
+    res = test_client.put(
+        "/api/detector-config",
+        headers={"X-Config-Mutations-Token": "test-admin-token"},
+        json=update,
+    )
 
     assert res.status_code == 200
     assert res.json() == update
@@ -682,6 +1050,50 @@ def test_live_model_run_persists_incrementally_and_can_be_evaluated(monkeypatch)
     assert evaluation.json()["result"]["status"] == "passed"
 
 
+def test_live_provider_failure_hides_credentials_from_responses_and_logs(monkeypatch, caplog):
+    from agent_replay.api import _redact_trace_text
+
+    username = "release-operator"
+    app_password = "test-only-application-password"
+    provider_key = "test-provider-key-secret"
+    live_token = "test-live-run-token-secret"
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("APP_AUTH_USERNAME", username)
+    monkeypatch.setenv("APP_AUTH_PASSWORD", app_password)
+    monkeypatch.setenv("OPENAI_API_KEY", provider_key)
+    monkeypatch.setenv("OPENAI_MODEL", "mock-live-model")
+    monkeypatch.setenv("LIVE_RUN_AUTH_TOKEN", live_token)
+    assert _redact_trace_text(f"{provider_key} {live_token} {app_password}") == (
+        "[REDACTED] [REDACTED] [REDACTED]"
+    )
+    app = create_app(storage=SQLiteStorage(db_path=":memory:"), live_run_enabled=True)
+    client = TestClient(app)
+
+    def fail_provider(provider, prompt, model):
+        raise RuntimeError(
+            f"provider rejected key={provider_key} token={live_token} password={app_password}"
+        )
+
+    monkeypatch.setattr("agent_replay.api.call_provider", fail_provider)
+    auth = (username, app_password)
+    response = client.post(
+        "/api/live/runs",
+        auth=auth,
+        headers={"X-Live-Run-Token": live_token},
+        json={"provider": "openai", "prompt": "safe test prompt"},
+    )
+
+    assert response.status_code == 202
+    run = client.get(f"/api/live/runs/{response.json()['run_id']}", auth=auth).json()
+    assert run["status"] == "failed"
+    assert run["error"] == "Provider execution failed."
+    assert run["events"][0]["error"] == "Provider execution failed."
+    for secret in (provider_key, live_token, app_password):
+        assert secret not in response.text
+        assert secret not in json.dumps(run)
+        assert secret not in caplog.text
+
+
 def test_live_model_run_enforces_single_process_concurrency(monkeypatch):
     import threading
 
@@ -750,10 +1162,10 @@ def test_live_model_provider_failure_is_persisted_as_failed(monkeypatch):
     assert created.status_code == 202
     run = client.get(f"/api/live/runs/{created.json()['run_id']}").json()
     assert run["status"] == "failed"
-    assert run["error"] == "Provider request failed (429)."
+    assert run["error"] == "Provider execution failed."
     assert run["event_count"] == 1
     assert run["events"][0]["result_json"] is None
-    assert run["events"][0]["error"] == "Provider request failed (429)."
+    assert run["events"][0]["error"] == "Provider execution failed."
 
 
 def test_live_model_run_rejects_unconfigured_provider_and_invalid_inputs(monkeypatch):
@@ -855,6 +1267,30 @@ def test_api_live_run_success_and_step_cap(client):
     assert "live_run_scenario_1_loop_" in data["session_id"]
 
 
+def test_api_live_runs_get_distinct_session_ids_within_same_second(monkeypatch):
+    from agent_replay import api as api_module
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 22, 12, 0, 0, tzinfo=tz or UTC)
+
+    monkeypatch.setattr(api_module, "datetime", FixedDateTime)
+    storage = SQLiteStorage(db_path=":memory:")
+    test_client = TestClient(create_app(storage=storage, live_run_enabled=True))
+
+    first = test_client.post("/api/live/run", json={"scenario_id": "scenario_2_recovery"})
+    second = test_client.post("/api/live/run", json={"scenario_id": "scenario_2_recovery"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_id = first.json()["session_id"]
+    second_id = second.json()["session_id"]
+    assert first_id != second_id
+    assert storage.get_session(first_id) is not None
+    assert storage.get_session(second_id) is not None
+
+
 def test_api_live_run_timeout(client):
     app = create_app(
         storage=SQLiteStorage(db_path=":memory:"),
@@ -873,3 +1309,60 @@ def test_api_live_run_timeout(client):
     data = res.json()
     assert data["status"] == "timed_out"
     assert "timed out after 0.05s" in data["message"]
+
+
+def test_timed_out_scenario_worker_is_cancelled_and_holds_single_worker_slot(monkeypatch):
+    started = threading.Event()
+    release_worker = threading.Event()
+    cancellation_observed = threading.Event()
+    storage = SQLiteStorage(db_path=":memory:")
+    client = TestClient(create_app(storage=storage, live_run_enabled=True))
+
+    def block_until_cancelled(_scenario_id, session_id, capped_storage, slow_delay=0.0):
+        started.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test worker release timed out")
+        try:
+            capped_storage.save_event(
+                Event(
+                    session_id=session_id,
+                    seq=1,
+                    type="tool_call",
+                    name="after-timeout",
+                    args_json="{}",
+                    started_at="2026-01-01T00:00:00+00:00",
+                )
+            )
+        except ScenarioCancelled:
+            cancellation_observed.set()
+
+    monkeypatch.setattr("agent_replay.api._run_scenario_sync", block_until_cancelled)
+    timed_out = client.post(
+        "/api/live/run",
+        json={"scenario_id": "scenario_1_loop", "timeout_seconds": 0.05},
+    )
+    assert started.wait(timeout=2)
+    assert timed_out.json()["status"] == "timed_out"
+
+    blocked = client.post(
+        "/api/live/run",
+        json={"scenario_id": "scenario_2_recovery", "timeout_seconds": 1},
+    )
+    assert blocked.status_code == 429
+
+    release_worker.set()
+    assert cancellation_observed.wait(timeout=2)
+
+    recovered = None
+    for _ in range(20):
+        recovered = client.post(
+            "/api/live/run",
+            json={"scenario_id": "scenario_2_recovery", "timeout_seconds": 2},
+        )
+        if recovered.status_code != 429:
+            break
+        time.sleep(0.01)
+
+    assert recovered is not None
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] in {"done", "step_limit_reached"}

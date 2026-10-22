@@ -14,9 +14,26 @@ class SQLiteStorage:
     """Thread-safe SQLite storage for agent recording sessions and events."""
 
     def __init__(self, db_path: str | Path | None = None):
+        configured_db_path = os.getenv("DB_PATH")
         remote_url = os.getenv("TURSO_DATABASE_URL")
         remote_token = os.getenv("TURSO_AUTH_TOKEN")
-        self.is_remote = db_path is None and bool(remote_url and remote_token)
+        is_vercel = bool(os.getenv("VERCEL"))
+        if is_vercel and db_path is None and configured_db_path:
+            raise RuntimeError(
+                "DB_PATH cannot select local SQLite on Vercel; unset DB_PATH to use Turso."
+            )
+        if is_vercel and db_path is None and not (remote_url and remote_token):
+            raise RuntimeError(
+                "Vercel storage requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN; "
+                "local SQLite is not durable across serverless invocations."
+            )
+        has_explicit_db_path = db_path is not None or bool(configured_db_path)
+        if not has_explicit_db_path and bool(remote_url) != bool(remote_token):
+            raise RuntimeError(
+                "Turso storage requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN; "
+                "set DB_PATH to explicitly select local SQLite."
+            )
+        self.is_remote = not has_explicit_db_path and bool(remote_url and remote_token)
         if self.is_remote:
             import turso_serverless
 
@@ -26,7 +43,7 @@ class SQLiteStorage:
             self._conn = turso_serverless.connect(remote_url, auth_token=remote_token)
             self._conn.row_factory = turso_serverless.Row
         else:
-            raw_path = str(db_path or DB_PATH)
+            raw_path = str(db_path or configured_db_path or DB_PATH)
             self.is_memory = raw_path == ":memory:" or "mode=memory" in raw_path
             self.db_path = (
                 f"file:mem_{id(self)}?mode=memory&cache=shared" if self.is_memory else raw_path
@@ -47,6 +64,10 @@ class SQLiteStorage:
 
     def _get_connection(self) -> sqlite3.Connection:
         return self._conn
+
+    def check_health(self) -> None:
+        with self._lock:
+            self._conn.execute("SELECT 1;").fetchone()
 
     def _init_db(self) -> None:
         with self._lock:
@@ -327,20 +348,86 @@ class SQLiteStorage:
     def list_sessions(self) -> list[SessionSummary]:
         with self._lock:
             cursor = self._conn.execute("""
+            WITH normalized_events AS (
+                SELECT
+                    id,
+                    session_id,
+                    type,
+                    error,
+                    error_type,
+                    started_at,
+                    duration_ms,
+                    cost_usd,
+                    tokens_in,
+                    tokens_out,
+                    tokens_total,
+                    CASE
+                        WHEN type = 'model_call'
+                            AND (cost_status IS NULL OR cost_status = 'unavailable')
+                            AND cost_usd != 0
+                        THEN 'estimated'
+                        ELSE COALESCE(NULLIF(cost_status, ''), 'unavailable')
+                    END AS normalized_cost_status
+                FROM events
+            )
             SELECT
                 s.session_id,
                 s.started_at,
                 COUNT(e.id) AS event_count,
                 COALESCE(SUM(e.cost_usd), 0.0) AS total_cost_usd,
                 COALESCE(SUM(e.duration_ms), 0.0) AS total_duration_ms,
-                MAX(CASE WHEN e.error IS NOT NULL AND e.error != '' THEN 1 ELSE 0 END) AS has_errors
+                MAX(CASE WHEN e.error IS NOT NULL AND e.error != '' THEN 1 ELSE 0 END)
+                    AS has_errors,
+                SUM(CASE
+                    WHEN e.id IS NOT NULL
+                        AND (e.error_type IS NULL OR e.error_type = '')
+                        AND (e.error IS NULL OR e.error = '')
+                    THEN 1 ELSE 0
+                END) AS successful_events,
+                SUM(CASE
+                    WHEN e.id IS NOT NULL
+                        AND (e.error_type IS NOT NULL AND e.error_type != ''
+                            OR e.error IS NOT NULL AND e.error != '')
+                    THEN 1 ELSE 0
+                END) AS failed_events,
+                SUM(CASE WHEN e.type = 'model_call' THEN 1 ELSE 0 END) AS model_call_count,
+                SUM(CASE
+                    WHEN e.type = 'model_call'
+                        AND ((e.tokens_total IS NOT NULL
+                                AND (e.tokens_in IS NULL OR e.tokens_out IS NULL))
+                            OR (e.tokens_total IS NULL
+                                AND (e.tokens_in IS NULL OR e.tokens_in = 0
+                                    OR e.tokens_out IS NULL OR e.tokens_out = 0)))
+                    THEN 1 ELSE 0
+                END) AS missing_model_usage_count,
+                SUM(CASE
+                    WHEN e.type = 'model_call' THEN e.cost_usd ELSE 0.0
+                END) AS model_total_cost_usd,
+                SUM(CASE
+                    WHEN e.type = 'model_call'
+                        AND e.normalized_cost_status = 'unavailable'
+                    THEN 1 ELSE 0
+                END) AS unavailable_model_cost_count,
+                SUM(CASE
+                    WHEN e.type = 'model_call'
+                        AND e.normalized_cost_status = 'estimated'
+                    THEN 1 ELSE 0
+                END) AS estimated_model_cost_count
             FROM sessions s
-            LEFT JOIN events e ON s.session_id = e.session_id
+            LEFT JOIN normalized_events e ON s.session_id = e.session_id
             GROUP BY s.session_id, s.started_at
-            ORDER BY s.started_at DESC;
+            ORDER BY s.started_at DESC, s.session_id DESC;
         """)
             summaries = []
             for row in cursor.fetchall():
+                model_call_count = row["model_call_count"]
+                unavailable_model_cost_count = row["unavailable_model_cost_count"]
+                if not model_call_count or unavailable_model_cost_count:
+                    model_total_cost_usd = None
+                    cost_status = "unavailable"
+                else:
+                    model_total_cost_usd = round(row["model_total_cost_usd"], 8)
+                    cost_status = "estimated" if row["estimated_model_cost_count"] else "actual"
                 summaries.append(
                     SessionSummary(
                         session_id=row["session_id"],
@@ -349,6 +436,12 @@ class SQLiteStorage:
                         total_cost_usd=round(row["total_cost_usd"], 6),
                         total_duration_ms=round(row["total_duration_ms"], 2),
                         has_errors=bool(row["has_errors"]),
+                        model_total_cost_usd=model_total_cost_usd,
+                        cost_status=cost_status,
+                        model_call_count=model_call_count,
+                        missing_model_usage_count=row["missing_model_usage_count"],
+                        successful_events=row["successful_events"],
+                        failed_events=row["failed_events"],
                     )
                 )
             return summaries

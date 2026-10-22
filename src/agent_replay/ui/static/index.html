@@ -6,7 +6,7 @@
   <title>agent-replay | Timeline & Observability</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link id="google-fonts" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" media="print">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -456,6 +456,10 @@
               <tbody id="pricing-table-body"></tbody>
             </table>
           </div>
+          <label class="control-group">
+            <span class="metric-label">Configuration token (not saved)</span>
+            <input id="pricing-auth-token" class="text-input" type="password" autocomplete="off" placeholder="Required when configuration protection is enabled">
+          </label>
           <button id="save-pricing-btn" class="btn btn-primary">Save pricing</button>
           <h3 class="section-heading">Cost over time</h3>
           <div id="cost-history" class="cost-history">
@@ -469,6 +473,10 @@
           <h2>Detector rules</h2>
           <p class="text-muted">Thresholds apply to newly loaded session evaluations.</p>
           <div id="detector-config-form" class="detector-config-form"></div>
+          <label class="control-group">
+            <span class="metric-label">Configuration token (not saved)</span>
+            <input id="detector-auth-token" class="text-input" type="password" autocomplete="off" placeholder="Required when configuration protection is enabled">
+          </label>
           <button id="save-detector-btn" class="btn btn-primary">Save detector rules</button>
           <p id="detector-config-status" class="text-muted"></p>
         </div>

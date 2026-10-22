@@ -108,6 +108,13 @@ The AI Playground calls a provider only after the user submits a prompt. Provide
 prompts are recorded in a dedicated Playground session for debugging, so do not submit secrets or
 personal data. Usage and cost displays label unavailable pricing instead of treating it as zero.
 
+Storage selection is explicit: a non-empty `DB_PATH` selects local SQLite even when Turso
+credentials are also configured. Without an explicit `DB_PATH`, configure both
+`TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` to select Turso; configuring only one now fails at
+startup instead of silently selecting SQLite. Environment variables supplied by the process take
+precedence over `.env`. For an isolated local run, set `DB_PATH` to a disposable database path
+before starting the app.
+
 Configure or customize token prices in `prices.json`:
 ```json
 {
@@ -309,6 +316,26 @@ It improved edge cases around focus visibility, mobile navigation, status chips,
 content while preserving the working behavior of traces, replay, experiments, usage/cost views,
 Playground safety messaging, and the Live Run disabled/status reporting.
 
+The session picker supports keyboard focus and Enter/Space activation, and marks the selected
+session for assistive technology. Empty traces distinguish sessions with no recorded events from
+traces whose events do not match the active filters. The browser audit used an isolated SQLite
+fixture database with dotenv loading disabled, avoiding the configured remote Turso store. It
+verified mouse and keyboard selection, trace output/error/empty states, strict validation history,
+experiment/evaluation screens, and truthful actual/estimated/unavailable cost labels. A strict
+validation and recorded-output evaluation were saved only in that disposable database. No provider
+calls or changes to existing user data were made.
+
+Automated checks passed: **106 tests** (one upstream Google GenAI deprecation warning), Ruff lint
+and format checks, JavaScript syntax check, and `git diff --check`. Browser checks covered all nine
+sections at 1440px and 390px, Replay Guide layout at 1024px and 768px, and cost-page overflow at
+1440px, 1024px, 768px, and 390px. Pages showed one active content panel without document-level
+horizontal overflow. Mobile navigation opened and closed with Escape, returning focus to its
+toggle; session rows had visible keyboard focus and each Enter/Space activation produced one item
+click and one selected row. Reduced-motion preferences reduced checked transition and animation
+durations to 0.01ms. Key text and status-token pairs measured at 6.94:1 or higher against their
+dark surfaces. Exhaustive component-state contrast checks and screen-reader testing remain
+unverified.
+
 ---
 
 ## 🌐 Interactive Timeline Web UI
@@ -352,6 +379,8 @@ The project includes a Vercel ASGI entrypoint in `api/index.py` and uses Turso f
 ```text
 TURSO_DATABASE_URL
 TURSO_AUTH_TOKEN
+APP_AUTH_USERNAME
+APP_AUTH_PASSWORD
 GEMINI_API_KEY
 DEFAULT_MODEL
 OPENAI_API_KEY
@@ -367,12 +396,239 @@ CONFIG_MUTATIONS_ENABLED
 
 Import `Deep1067/CS26048-AgentReplay` into Vercel with the repository root as the project directory. The first application startup creates the required sessions, events, and settings tables automatically. Pricing and detector settings are stored in the database when Turso is configured; local development continues to use SQLite and local configuration files.
 
+Vercel startup fails closed unless both Turso credentials and application authentication
+credentials are configured. `APP_AUTH_USERNAME` and an `APP_AUTH_PASSWORD` of at least 24
+characters enable HTTP Basic authentication for the UI, static assets, OpenAPI docs, and all APIs.
+Use HTTPS and a unique high-entropy password. `/healthz` and `/readyz` remain unauthenticated for
+platform probes; readiness exposes only available/unavailable status.
+Outside Vercel, application authentication is enabled only when both application credentials are
+set. Without them, the app has no user/session access control; do not expose that instance to an
+untrusted network. Local development can remain unauthenticated on loopback.
+
 `LIVE_RUN_ENABLED` and `CONFIG_MUTATIONS_ENABLED` default to `false`. Remote provider execution
 also requires `LIVE_RUN_AUTH_TOKEN`; remote pricing/detector edits separately require
-`CONFIG_MUTATIONS_AUTH_TOKEN`. Never expose provider keys in frontend configuration.
+`CONFIG_MUTATIONS_AUTH_TOKEN`. The UI submits those separate tokens through transient password
+fields and custom headers; it does not save them in browser storage. Never expose provider keys in
+frontend configuration.
 The built-in monitor can refresh recorded sessions and instrumented integrations can still record
 into configured storage when provider execution is disabled. This setting does not enable
 arbitrary agent-graph or tool execution.
+
+The server does not use forwarded client-address headers for provider/configuration authorization.
+`ALLOW_LOOPBACK_PRIVILEGED_ACTIONS` is an explicit local-development convenience, defaulting to
+false and ignored on Vercel. Enable it only for a standalone loopback server, never behind a proxy.
+Otherwise the separate provider/configuration tokens are required even on loopback.
+There is no general per-user or per-IP API rate limiter. Live model requests and fixed scenarios
+have separate single-worker admission limits per app instance; protect broader traffic at the
+deployment edge.
+
+### Phase 7 release-readiness status
+
+Phase 7 established local integration/security evidence and documented the remaining release
+blockers. The Phase 8 work below adds an application-wide access gate for Vercel but does not
+constitute deployment or production verification.
+
+### Phase 8 release hardening and deployment readiness
+
+Vercel uses Turso rather than silently accepting ephemeral local SQLite. Startup requires both
+Turso credentials and rejects an environment `DB_PATH` override; unset `DB_PATH` in Vercel so the
+configured Turso backend is selected. Outside Vercel, explicit `DB_PATH` precedence and
+partial-Turso validation remain covered by automated tests, and legacy SQLite schema migration is
+tested against a disposable database.
+
+Vercel also requires configured HTTP Basic application credentials. All UI/API routes are gated
+except `/healthz` (process health) and `/readyz` (storage readiness); the endpoints return no
+credentials or backend connection details. Provider execution and configuration mutations still
+have their separate token gates. Forwarded IP headers do not authorize privileged operations.
+
+Fixed scenarios now use one bounded worker per process. On timeout, the API marks the attempt
+timed out, prevents further event writes, and keeps the worker slot occupied until the synchronous
+operation returns. Python cannot forcibly interrupt an already-running blocking tool/provider call;
+the actual operation may continue after the HTTP timeout. The five-event step cap and default-off
+execution flag remain.
+Provider failures return generic client-facing errors, log only the exception type and run context,
+and do not persist raw provider exception text. Known configured keys and auth tokens are scrubbed
+from recorded prompt/output text.
+
+The project dependency resolution passed `python -m pip_audit -r requirements.txt --progress-spinner off`
+with no known advisories.
+The installed interpreter audit initially found vulnerable AnyIO 4.14.1 and Starlette 0.41.3;
+the manifest floors were raised and those runtime packages were upgraded. The same interpreter
+also contained findings in packages not declared in the project manifests (pip, Pillow,
+python-multipart, and setuptools); they were not modified as part of this project-scoped fix.
+
+Automated verification passed: **124 tests**, Ruff lint and format checks, JavaScript syntax check,
+`git diff --check`, and `pip check`. A local browser smoke test used a fresh temporary SQLite
+database: navigation opened all workspace sections, empty session/trace states rendered, and the
+Live Monitor remained disabled with no provider configured. At 390px there was no horizontal
+overflow and reduced-motion preference was detected; no browser errors or failed requests were
+observed. This did not exercise session-backed replay/evaluation workflows or deployed behavior.
+No Turso connection, Vercel deployment, real provider call, production database test, or
+deployment-proxy behavior was tested. One earlier test-collection attempt loaded the repository
+`.env`, selected its configured Turso database during module-level app initialization, and failed
+after the remote disconnected. Initialization may have executed idempotent schema DDL before that
+failure; the remote store was not revisited.
+`tests/conftest.py` now disables dotenv and external credentials before test collection and uses
+isolated local storage/settings.
+
+Private staging has not been authorized or run. Before any remote database operation, follow this
+gated checklist; do not use the previously configured database or its credentials.
+
+1. **Owner review and target authorization (mandatory gate).** Ask the owner of the previously
+   configured Turso database to review its schema and audit history because initialization may have
+   applied DDL. Do not reconnect to it. Separately provision a non-production Turso database and
+   obtain explicit authorization to use that target. Record the staging target's non-secret
+   identity and have the owner/operator verify credentials point to it without printing, logging,
+   or copying secret values into source files, tickets, terminal output, or reports.
+2. **Private deployment configuration.** Create/use a private, non-production Vercel project.
+   Set Turso URL/token and application Basic-auth credentials only in its private Preview
+   environment; leave `DB_PATH` unset and keep `LIVE_RUN_ENABLED` and
+   `CONFIG_MUTATIONS_ENABLED` false. Do not reuse Production variables or production data.
+   Verify missing/partial Turso configuration, missing app credentials, and a `DB_PATH` override
+   fail closed; verify `/healthz` reports process health and `/readyz` reports storage readiness
+   without revealing secrets or backend details.
+3. **Cross-invocation persistence.** Using only synthetic disposable records, create a session and
+   related event, plus replay-validation and evaluation history where applicable. Read those exact
+   identifiers through separate fresh function invocations and confirm records/history persist in
+   the authorized staging database. Exercise a database-unavailable/misconfigured case and confirm
+   readiness/failure behavior is clear and there is no SQLite fallback. Remove only the test
+   records created for this check, and only after confirming their identifiers and target.
+4. **Private access and privileged endpoints.** Through the deployed Vercel URL, verify missing
+   and invalid Basic credentials are rejected and authorized credentials can use intended UI/API
+   reads. Verify `/healthz` and `/readyz` remain probe-accessible and disclose no sensitive details.
+   With privileged features still disabled, confirm Live Run and configuration mutation cannot
+   write. If separately authorized to test their gates, use only non-production credentials and
+   disposable configuration: verify missing/invalid `LIVE_RUN_AUTH_TOKEN` and
+   `CONFIG_MUTATIONS_AUTH_TOKEN` are rejected and valid tokens authorize only their respective
+   operations. Do not submit a real provider request.
+5. **Proxy and rate controls.** Send spoofed `X-Forwarded-For` and related forwarded headers and
+   verify they do not bypass authentication or privileged-token checks. Confirm the deployed edge
+   rate-limit policy is configured and exercise its documented threshold with harmless requests.
+   Record that the application has no general per-user/per-IP API rate limiter; keep staging
+   private and do not treat proxy-header tests as evidence for another deployment topology.
+6. **Execution/dependency evidence.** Keep provider calls mocked or disabled. Verify configured
+   request limits, timeout behavior, post-timeout write suppression, concurrency admission, and
+   failure/redaction behavior without exposing credentials. A timed-out blocking Python worker
+   cannot be forcibly terminated. Audit the exact deployed dependency resolution and resolve or
+   explicitly accept findings before any public release.
+7. **Evidence and cleanup.** Record timestamps, deployment/environment identity, test case, and
+   pass/fail outcome without credentials, tokens, private database URLs, personal data, or raw
+   sensitive logs. If a step fails, stop release progression, preserve evidence safely, and fix or
+   document the blocker. Do not deploy publicly or call real providers as part of this checklist.
+
+### Phase 9 private staging and release verification
+
+Private staging was **not performed**. The ignored repository `.env` was present but not opened
+or used; the current process had no Turso credentials and no separately provisioned non-production
+target or explicit authorization was confirmed. No remote database or deployment operation was
+attempted. Do not connect to the database implicated by the earlier failed initialization: its
+owner must first review the schema/audit trail because idempotent DDL may have run.
+
+Local-only verification used `PYTHON_DOTENV_DISABLED=true`, a fresh temporary SQLite database,
+deterministic session fixtures, and no provider credentials. A separate process reopened the
+database after the app stopped and verified session, fork, strict-replay, and evaluation-history
+persistence. This does not establish Turso or serverless persistence.
+
+Browser smoke testing exercised all nine workspace sections; mouse, Enter, and Space session
+selection; visible focus retained after keyboard selection; error trace/output and empty-session
+rendering; strict replay of a recorded error and saved history; a controlled fork comparison; saved
+evaluation history; and unavailable usage/cost messaging. The 390px viewport had no horizontal
+overflow, reduced motion was active, and Live Run remained disabled without provider configuration.
+No provider call was made. There were no page console errors or failed app/API requests; the initial
+automatic `/favicon.ico` request returned 404.
+
+The keyboard smoke revealed that the old custom `div[role=button]` session picker lost focus and
+could activate twice. It is now a native button, with regression coverage; Enter/Space retain focus
+and selection in the browser check. The app still has no general per-user/per-IP API rate limiter.
+Keep it private behind the configured access boundary and apply edge rate controls before wider
+exposure.
+
+Local automated checks passed: 124 pytest tests; Ruff lint and format; JavaScript syntax;
+`git diff --check`; `pip check`; and
+`python -m pip_audit -r requirements.txt --progress-spinner off` (no known advisories in the
+resolved declared dependencies).
+Authentication, privileged-token enforcement, forwarding-header handling, concurrency, timeouts,
+failure recording, and redaction have local/mock evidence only. A blocking synchronous worker
+cannot be forcibly terminated and may continue after the request times out. Vercel, Turso, private
+deployment authentication, health/readiness through platform probes, proxy behavior, and remote
+cross-invocation persistence remain unverified. **Release decision: still blocked.**
+
+The checklist above has not been run. Its first item is a hard gate: the previous database owner
+must review the possible DDL, and a separate non-production Turso target must be provisioned and
+explicitly authorized before any remote database connection. Do not use production
+credentials/data, deploy without authorization, expose secrets, or call real providers.
+
+### Local performance investigation
+
+The following is a reproducible local SQLite/TestClient measurement, not Vercel or Turso evidence.
+The fixture contained **80 synthetic sessions and 1,200 synthetic events**; each API latency is
+the median of five requests against that same fixture. Read-operation counts come from SQLite's
+statement trace callback, and response sizes are the TestClient response-body byte counts.
+
+| Endpoint | Before: reads / median / bytes | After: reads / median / bytes |
+|---|---:|---:|
+| `GET /api/sessions` | 81 / 27.92 ms / 15,521 B | 1 / 6.12 ms / 15,521 B |
+| `GET /api/overview` | 331 / 139.97 ms / 1,128 B | 1 / 5.22 ms / 1,128 B |
+| `GET /api/sessions/{id}` | 3 / 6.95 ms / 9,857 B | 3 / 6.14 ms / 9,857 B |
+
+The session list previously ran `get_events` once per session merely to derive model cost/status.
+The overview additionally loaded details and complete event objects repeatedly, including detector
+work, even though its response only needs summary metrics. Storage now aggregates the required
+summary, cost availability, success/failure, and token-availability fields in its grouped query.
+The public response shape and unavailable/estimated/actual cost semantics are preserved. The
+existing `(session_id, seq)` event index is used; SQLite still sorts/groups through temporary
+B-trees. No pagination or additional index was introduced.
+
+Browser measurements with the same local fixture showed the default Overview startup dropping from
+**7 API requests to 2** (`/api/sessions` and `/api/overview`). Previously it fetched the first
+session's full trace, fork baselines, and replay history before those sections were opened.
+Selecting a session dropped from **7 API requests to 1**: the duplicate full trace (10,157 browser
+transfer bytes) and hidden replay/evaluation histories are now deferred. Opening Replay Guide
+fetches its fork baselines and one validation history, reusing the already loaded trace when it
+matches; opening Replay fetches its history then. Browser checks confirmed the selected session and
+guide status still load correctly.
+
+The first local browser load also exposed a separate blocking external-font cost: the Google Fonts
+stylesheet took **656 ms**, while that navigation reported **1,069 ms DOMContentLoaded** and
+**1,756 ms loadEventEnd**. Aborting the font request experimentally reduced DOMContentLoaded to
+208 ms (the expected failed-request console error was intentional). The stylesheet is now declared
+with non-blocking print media and switched to screen media by the application script. With a
+synthetic 1,200 ms delayed font request, DOMContentLoaded occurred at **335 ms**, and the sessions
+and overview API requests completed in **148 ms** and **196 ms** while the font request was still
+pending. The same font families remain in use; this is a local browser measurement and must be
+rechecked under the actual deployment/network path.
+
+Local cold module import plus default SQLite app initialization took **939 ms** in one process. It
+includes Python imports and local schema initialization and is not a Vercel cold-start measurement.
+Code inspection shows storage initialization and the Turso connection are created when the
+module-level app is initialized, not once per ordinary request; a serverless cold worker may repeat
+that work. Actual cold/warm function latency, Turso connection establishment, remote query latency,
+and data-scale behavior remain hypotheses until authorized private staging.
+
+For authorized private staging, first complete the database-owner review and distinct staging-target
+authorization gate above. Then use only synthetic sessions, private access, and providers disabled:
+
+1. Capture a fresh Preview page navigation in browser Performance tools and record document
+   response, DOMContentLoaded, load, Google Fonts request, and `/api/sessions` plus `/api/overview`
+   request durations and transfer sizes. Repeat on a warm invocation; label first/cold and
+   subsequent/warm observations separately.
+2. Select a synthetic session and record `/api/sessions/{id}` latency/size. Open Replay and Replay
+   Guide and record the validation-history, baseline, and evaluation requests separately. Check
+   request counts as well as payload sizes; do not include session content in reports.
+3. Correlate each request with Vercel function duration, cold-start/region data, and timeout/errors
+   using non-sensitive request identifiers. If Turso timing is instrumented, log only aggregate
+   operation count and elapsed time per request—never SQL parameters, event bodies, credentials,
+   tokens, or database URLs.
+4. Repeat with representative synthetic session/event counts, and test only the authorized
+   non-production database. Do not reconnect to the previous target, use production data, deploy
+   publicly, or invoke real providers.
+
+Final local regression after these changes: `python -m pytest -q` passed **127 tests**;
+`python -m ruff check .`, `python -m ruff format --check .`, JavaScript syntax validation,
+`git diff --check`, `python -m pip check`, and the project-scoped
+`python -m pip_audit -r requirements.txt --progress-spinner off` all passed. A fresh local browser
+reload and synthetic session selection reported no console errors or failed requests. These checks
+do not verify Turso, Vercel, or deployed performance.
 
 ---
 

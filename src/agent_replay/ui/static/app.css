@@ -217,12 +217,16 @@ body {
 }
 
 .session-item {
+  display: block;
+  width: 100%;
   padding: 12px;
   border-radius: 8px;
   border: 1px solid transparent;
   cursor: pointer;
   transition: all 0.2s;
   background: var(--bg-card);
+  color: var(--text-primary);
+  text-align: left;
 }
 
 .session-item:hover {

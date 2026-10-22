@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import hmac
 import ipaddress
 import json
@@ -8,13 +10,14 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -53,22 +56,36 @@ class StepLimitExceeded(Exception):
     pass
 
 
+class ScenarioCancelled(Exception):
+    """Raised when a timed-out scenario attempts another persisted action."""
+
+
 class StepCappedStorage:
     """Storage proxy enforcing a hard cap of N recorded events per session."""
 
-    def __init__(self, target: SQLiteStorage, max_steps: int = 5):
+    def __init__(
+        self,
+        target: SQLiteStorage,
+        max_steps: int = 5,
+        cancelled: threading.Event | None = None,
+    ):
         self.target = target
         self.max_steps = max_steps
         self.step_count = 0
+        self.cancelled = cancelled or threading.Event()
         self.is_remote = getattr(target, "is_remote", False)
 
     def create_session(self, session_id: str, metadata: dict[str, Any] | None = None) -> str:
+        if self.cancelled.is_set():
+            raise ScenarioCancelled()
         return self.target.create_session(session_id, metadata)
 
     def get_next_seq(self, session_id: str) -> int:
         return self.target.get_next_seq(session_id)
 
     def save_event(self, event: Event) -> Event:
+        if self.cancelled.is_set():
+            raise ScenarioCancelled()
         if self.step_count >= self.max_steps:
             raise StepLimitExceeded(f"Hard step cap of {self.max_steps} reached.")
         res = self.target.save_event(event)
@@ -313,7 +330,20 @@ def _redact_trace_text(value: str) -> str:
     redacted = value
     redacted = _SECRET_TEXT_PATTERNS[0].sub("[REDACTED]", redacted)
     redacted = _SECRET_TEXT_PATTERNS[1].sub(r"\1[REDACTED]", redacted)
-    return _SECRET_TEXT_PATTERNS[2].sub(r"\1[REDACTED]", redacted)
+    redacted = _SECRET_TEXT_PATTERNS[2].sub(r"\1[REDACTED]", redacted)
+    for name in (
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "TURSO_AUTH_TOKEN",
+        "APP_AUTH_PASSWORD",
+        "LIVE_RUN_AUTH_TOKEN",
+        "CONFIG_MUTATIONS_AUTH_TOKEN",
+    ):
+        secret = os.getenv(name, "")
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
 
 
 def _optional_usage_count(value: Any) -> int | None:
@@ -332,6 +362,16 @@ def create_app(
     live_run_enabled: bool | None = None,
     config_mutations_enabled: bool | None = None,
 ) -> FastAPI:
+    auth_username = os.getenv("APP_AUTH_USERNAME", "")
+    auth_password = os.getenv("APP_AUTH_PASSWORD", "")
+    is_vercel = bool(os.getenv("VERCEL"))
+    if bool(auth_username) != bool(auth_password):
+        raise RuntimeError("APP_AUTH_USERNAME and APP_AUTH_PASSWORD must be configured together.")
+    if auth_password and len(auth_password) < 24:
+        raise RuntimeError("APP_AUTH_PASSWORD must be at least 24 characters long.")
+    if is_vercel and not auth_username:
+        raise RuntimeError("APP_AUTH_USERNAME and APP_AUTH_PASSWORD are required on Vercel.")
+
     app = FastAPI(
         title="agent-replay",
         description="A logging proxy and replay engine for AI agent tool and model calls.",
@@ -346,12 +386,49 @@ def create_app(
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def require_application_auth(request: Request, call_next):
+        if (
+            not auth_username
+            or request.method == "OPTIONS"
+            or request.url.path in {"/healthz", "/readyz"}
+        ):
+            return await call_next(request)
+
+        authorization = request.headers.get("authorization", "")
+        parts = authorization.split(" ", 1)
+        authorized = False
+        if len(parts) == 2 and parts[0].lower() == "basic":
+            try:
+                decoded = base64.b64decode(parts[1], validate=True).decode("utf-8")
+                supplied_username, separator, supplied_password = decoded.partition(":")
+                username_matches = hmac.compare_digest(supplied_username, auth_username)
+                password_matches = hmac.compare_digest(supplied_password, auth_password)
+                authorized = bool(separator and username_matches and password_matches)
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                authorized = False
+        if not authorized:
+            return PlainTextResponse(
+                "Authentication required.",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="AgentReplay", charset="UTF-8"'},
+            )
+        return await call_next(request)
+
     actual_storage = storage or SQLiteStorage()
     allow_live_runs = LIVE_RUN_ENABLED if live_run_enabled is None else live_run_enabled
     allow_config_mutations = (
         CONFIG_MUTATIONS_ENABLED if config_mutations_enabled is None else config_mutations_enabled
     )
     live_model_run_slot = threading.BoundedSemaphore(1)
+    live_scenario_slot = threading.BoundedSemaphore(1)
+    scenario_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="agent-replay-scenario",
+    )
+    allow_loopback_privileged_actions = not is_vercel and os.getenv(
+        "ALLOW_LOOPBACK_PRIVILEGED_ACTIONS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
     price_engine = get_price_engine()
     stored_prices = actual_storage.get_setting("prices")
     if isinstance(stored_prices, dict):
@@ -366,28 +443,45 @@ def create_app(
         detector=DetectorEngine(config=detector_config),
     )
 
-    def authorize_provider_execution(request: Request) -> None:
-        client_host = request.client.host if request.client else ""
-        try:
-            is_loopback = ipaddress.ip_address(client_host).is_loopback
-        except ValueError:
-            is_loopback = client_host == "testclient"
-        if is_loopback:
-            return
+    def authorize_server_token(
+        request: Request,
+        *,
+        token_name: str,
+        header_name: str,
+        purpose: str,
+    ) -> None:
+        if allow_loopback_privileged_actions:
+            client_host = request.client.host if request.client else ""
+            try:
+                is_loopback = ipaddress.ip_address(client_host).is_loopback
+            except ValueError:
+                is_loopback = client_host == "testclient"
+            if is_loopback:
+                return
 
-        configured_token = os.getenv("LIVE_RUN_AUTH_TOKEN", "")
+        configured_token = os.getenv(token_name, "")
         if not configured_token:
             raise HTTPException(
                 status_code=503,
-                detail="Remote provider execution requires LIVE_RUN_AUTH_TOKEN on the server.",
+                detail=f"{purpose} requires {token_name} on the server.",
             )
-        authorization = request.headers.get("authorization", "")
-        prefix = "Bearer "
-        supplied_token = authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        supplied_token = request.headers.get(header_name, "")
+        if not supplied_token and not auth_username:
+            authorization = request.headers.get("authorization", "")
+            prefix = "Bearer "
+            supplied_token = (
+                authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+            )
         if not supplied_token or not hmac.compare_digest(supplied_token, configured_token):
-            raise HTTPException(
-                status_code=401, detail="Remote provider execution is unauthorized."
-            )
+            raise HTTPException(status_code=401, detail=f"{purpose} is unauthorized.")
+
+    def authorize_provider_execution(request: Request) -> None:
+        authorize_server_token(
+            request,
+            token_name="LIVE_RUN_AUTH_TOKEN",
+            header_name="X-Live-Run-Token",
+            purpose="Provider execution",
+        )
 
     def authorize_config_mutation(request: Request) -> None:
         if not allow_config_mutations:
@@ -395,31 +489,12 @@ def create_app(
                 status_code=403,
                 detail="Configuration changes are disabled on this server.",
             )
-        client_host = request.client.host if request.client else ""
-        try:
-            is_loopback = ipaddress.ip_address(client_host).is_loopback
-        except ValueError:
-            is_loopback = client_host == "testclient"
-        if is_loopback:
-            return
-
-        configured_token = os.getenv("CONFIG_MUTATIONS_AUTH_TOKEN", "")
-        if not configured_token:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Remote configuration changes require CONFIG_MUTATIONS_AUTH_TOKEN "
-                    "on the server."
-                ),
-            )
-        authorization = request.headers.get("authorization", "")
-        prefix = "Bearer "
-        supplied_token = authorization[len(prefix) :] if authorization.startswith(prefix) else ""
-        if not supplied_token or not hmac.compare_digest(supplied_token, configured_token):
-            raise HTTPException(
-                status_code=401,
-                detail="Remote configuration change is unauthorized.",
-            )
+        authorize_server_token(
+            request,
+            token_name="CONFIG_MUTATIONS_AUTH_TOKEN",
+            header_name="X-Config-Mutations-Token",
+            purpose="Configuration changes",
+        )
 
     def configured_provider_model(provider_id: str, requested_model: str | None) -> str:
         provider = next(
@@ -477,6 +552,19 @@ def create_app(
 
     static_dir = Path(__file__).parent / "ui" / "static"
 
+    @app.get("/healthz")
+    def get_health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    def get_readiness() -> dict[str, str]:
+        try:
+            actual_storage.check_health()
+        except Exception as exc:
+            logger.warning("Storage readiness check failed (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Storage is unavailable.") from None
+        return {"status": "ready", "storage": "available"}
+
     @app.get("/api/sessions")
     def list_sessions() -> list[dict[str, Any]]:
         """List all recorded sessions with summary metrics."""
@@ -484,32 +572,28 @@ def create_app(
         items = []
         for summary in summaries:
             item = summary.to_dict()
-            item["total_cost_usd"], item["cost_status"] = cost_summary(
-                actual_storage.get_events(summary.session_id)
-            )
+            item["total_cost_usd"] = summary.model_total_cost_usd
+            item["cost_status"] = summary.cost_status
             items.append(item)
         return items
 
     @app.get("/api/overview")
     def get_overview() -> dict[str, Any]:
         summaries = actual_storage.list_sessions()
-        total_events = sum(item.event_count for item in summaries)
-        details = [session_service.get_session_details(item.session_id) for item in summaries]
-        all_events = [
-            event for item in summaries for event in actual_storage.get_events(item.session_id)
-        ]
+        model_call_count = sum(item.model_call_count for item in summaries)
         return {
             "session_count": len(summaries),
-            "event_count": total_events,
-            "successful_events": sum(item["successful_events"] for item in details if item),
-            "failed_events": sum(item["failed_events"] for item in details if item),
+            "event_count": sum(item.event_count for item in summaries),
+            "successful_events": sum(item.successful_events for item in summaries),
+            "failed_events": sum(item.failed_events for item in summaries),
             "total_duration_ms": round(sum(item.total_duration_ms for item in summaries), 2),
-            "model_usage_available": token_usage_summary(all_events)[2],
+            "model_usage_available": model_call_count > 0
+            and all(item.missing_model_usage_count == 0 for item in summaries),
             "recent_sessions": [
                 {
                     **item.to_dict(),
-                    "total_cost_usd": cost_summary(actual_storage.get_events(item.session_id))[0],
-                    "cost_status": cost_summary(actual_storage.get_events(item.session_id))[1],
+                    "total_cost_usd": item.model_total_cost_usd,
+                    "cost_status": item.cost_status,
                 }
                 for item in summaries[:5]
             ],
@@ -1516,41 +1600,39 @@ def create_app(
                 },
             )
         except Exception as exc:
-            logger.exception(
-                "Live provider execution failed: session_id=%s provider=%s",
+            logger.error(
+                "Live provider execution failed: session_id=%s provider=%s error_type=%s",
                 session_id,
                 provider,
+                type(exc).__name__,
             )
             if event_saved:
-                event.error = _redact_trace_text(
-                    str(exc)
-                    if isinstance(exc, (RuntimeError, ValueError))
-                    else "Provider execution failed."
-                )
+                event.error = "Provider execution failed."
                 event.error_type = type(exc).__name__
                 event.duration_ms = round((time.perf_counter() - started) * 1000, 2)
                 try:
                     actual_storage.update_event(event)
-                except Exception:
-                    logger.exception(
-                        "Unable to finalize failed live event: session_id=%s", session_id
+                except Exception as update_exc:
+                    logger.error(
+                        "Unable to finalize failed live event: session_id=%s error_type=%s",
+                        session_id,
+                        type(update_exc).__name__,
                     )
-            error_message = (
-                _redact_trace_text(str(exc))
-                if isinstance(exc, (RuntimeError, ValueError))
-                else "Provider execution failed; inspect server logs."
-            )
             try:
                 actual_storage.update_session_metadata(
                     session_id,
                     {
                         "run_status": "failed",
                         "run_finished_at": _utc_now(),
-                        "run_error": error_message,
+                        "run_error": "Provider execution failed.",
                     },
                 )
-            except Exception:
-                logger.exception("Unable to persist live run failure: session_id=%s", session_id)
+            except Exception as metadata_exc:
+                logger.error(
+                    "Unable to persist live run failure: session_id=%s error_type=%s",
+                    session_id,
+                    type(metadata_exc).__name__,
+                )
         finally:
             live_model_run_slot.release()
 
@@ -1640,9 +1722,13 @@ def create_app(
                 model,
                 request.prompt,
             )
-        except Exception:
+        except Exception as exc:
             live_model_run_slot.release()
-            logger.exception("Unable to queue live run: session_id=%s", session_id)
+            logger.error(
+                "Unable to queue live run: session_id=%s error_type=%s",
+                session_id,
+                type(exc).__name__,
+            )
             raise HTTPException(status_code=500, detail="Unable to queue the live run.") from None
         return {
             "run_id": session_id,
@@ -1670,8 +1756,13 @@ def create_app(
             )
 
         timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        session_id = f"live_run_{request.scenario_id}_{timestamp}"
-        capped_storage = StepCappedStorage(actual_storage, max_steps=5)
+        session_id = f"live_run_{request.scenario_id}_{timestamp}_{uuid.uuid4().hex[:12]}"
+        cancellation = threading.Event()
+        capped_storage = StepCappedStorage(
+            actual_storage,
+            max_steps=5,
+            cancelled=cancellation,
+        )
         timeout_sec = request.timeout_seconds if request.timeout_seconds is not None else 15.0
 
         status = "done"
@@ -1681,26 +1772,65 @@ def create_app(
                     asyncio.sleep(request.simulate_delay_seconds),
                     timeout=timeout_sec,
                 )
-            await asyncio.wait_for(
-                asyncio.to_thread(
+        except TimeoutError:
+            status = "timed_out"
+        except Exception as exc:
+            logger.error(
+                "Live scenario failed: scenario_id=%s session_id=%s error_type=%s",
+                request.scenario_id,
+                session_id,
+                type(exc).__name__,
+            )
+            status = "error"
+
+        if status == "done":
+            if not live_scenario_slot.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=429,
+                    detail="A fixed scenario is still running; try again when it finishes.",
+                )
+            try:
+                scenario_future = scenario_executor.submit(
                     _run_scenario_sync,
                     request.scenario_id,
                     session_id,
                     capped_storage,
-                ),
-                timeout=timeout_sec,
-            )
-        except TimeoutError:
-            status = "timed_out"
-        except StepLimitExceeded:
-            status = "step_limit_reached"
-        except Exception:
-            logger.exception(
-                "Live scenario failed: scenario_id=%s session_id=%s",
-                request.scenario_id,
-                session_id,
-            )
-            status = "error"
+                )
+            except Exception as exc:
+                live_scenario_slot.release()
+                logger.error(
+                    "Unable to start live scenario: session_id=%s error_type=%s",
+                    session_id,
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Unable to start the live scenario.",
+                ) from None
+            scenario_future.add_done_callback(lambda _future: live_scenario_slot.release())
+            try:
+                await asyncio.wait_for(
+                    asyncio.wrap_future(scenario_future),
+                    timeout=timeout_sec,
+                )
+            except asyncio.CancelledError:
+                cancellation.set()
+                raise
+            except TimeoutError:
+                cancellation.set()
+                status = "timed_out"
+            except StepLimitExceeded:
+                status = "step_limit_reached"
+            except ScenarioCancelled:
+                status = "timed_out"
+            except Exception as exc:
+                logger.error(
+                    "Live scenario failed: scenario_id=%s session_id=%s error_type=%s",
+                    request.scenario_id,
+                    session_id,
+                    type(exc).__name__,
+                )
+                status = "error"
 
         details = session_service.get_session_details(session_id)
         event_count = details["event_count"] if details else capped_storage.step_count
